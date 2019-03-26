@@ -1,0 +1,2637 @@
+---
+title: "bruneck WGCNA"
+author: "Simon Couvreur"
+date: "27 January 2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(here)
+library(WGCNA)
+library(tidyverse)
+library(glue)
+library(corrplot)
+library(survival)
+library(broom)
+library(tidylog)
+library(readODS)
+library(httr)
+library(purrr)
+library(gplots)
+library(fastDummies)
+library(RColorBrewer)
+library(rms)
+library(cowplot)
+library(ComplexHeatmap)
+library(circlize)
+
+source("heatmap_3.R")
+source("color_palettes.R")
+source("make_pedersen_heatmap.R")
+source("make_complex_heatmap.R")
+source("get_me_pheno_associations.R")
+source("get_saphir_pheno_associations.R")
+
+resultdir <- "/home/simon/Dropbox/Simon Mini Project/results/multi-omics-project/"
+figdir <- file.path(resultdir, "figs")
+datadir <- "/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data"
+cluster_pars_dir <- "/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/bruneck/clustering_input_params"
+
+```
+
+```{r functions}
+
+optimize_network_pars <- function(common_pars, pars, powers, hline=0.80, plt_title){
+  
+  sft_df <- data.frame()
+  for (i in 1:nrow(pars)){
+    print(i)
+    iter_pars <- c(common_pars, list(corFnc = pars$corFnc[i], networkType= pars$networktype[i]))
+    sft <- do.call(pickSoftThreshold, iter_pars)
+    # browser()
+    sft_df <- sft$fitIndices %>%
+      dplyr::mutate(networktype= pars$networktype[i],
+             corFnc=pars$corFnc[i]) %>%
+      rbind(sft_df,.)
+  }
+  
+  p_rsq <- sft_df %>%
+    dplyr::mutate(signed_rsq = -sign(slope)*SFT.R.sq) %>%
+    ggplot(aes(x=Power, y= signed_rsq))+
+    geom_text(aes(label=Power))+
+    facet_grid(networktype~corFnc)+
+    scale_y_continuous(breaks = seq(-1,1,by=0.1))+
+    geom_hline(yintercept=hline, color="red", alpha=0.5)+
+    labs(title = glue("{plt_title} - rsq"))+
+    theme_bw()
+  
+  p_k <- sft_df %>%
+    ggplot(aes(x=Power, y= mean.k.))+
+    geom_text(aes(label=Power))+
+    facet_grid(networktype~corFnc)+
+    labs(title = glue("{plt_title} - k"))+
+    # scale_y_continuous(breaks = seq(-1,1,by=0.1))+
+    theme_bw()
+  
+  return(list(p_rsq=p_rsq, p_k=p_k, sft_df=sft_df))
+}
+
+build_TOM <- function(datExpr, networktype, softpower, corfnc){
+  adj <- adjacency(datExpr = datExpr,
+                  type = networktype,
+                  power=softpower,
+                  corFnc = corfnc)
+  TOM <- TOMsimilarity(adj)
+  TOM
+}
+
+
+build_TOM_opt_par <- function(cluster_index, data, pars){
+  softpower <- pars$softpower[cluster_index]
+  corfnc <- pars$corfnc[cluster_index]
+  networktype <- pars$networktype[cluster_index]
+  
+  build_TOM(data, networktype, softpower, corfnc)
+}
+
+recode_color_label <- function(colorcodes, data_name){
+  glue("{data_name}_{colorcodes}") %>% 
+    gsub(., pattern = "#", replacement = "")
+}
+
+define_modules <- function(data, data_name, figdir, softpower, corfnc, networktype, method="average", minModuleSize = 20, deep=1, feat_modality=NA){
+  
+  # browser()
+  TOM = build_TOM(datExpr = data,
+                  networktype = networktype,
+                  softpower=softpower,
+                  corfnc = corfnc)
+  dissTOM = 1-TOM
+  
+  feat_hc = hclust(as.dist(dissTOM), method = method)
+  
+  # Module identification using dynamic tree cut:
+  dynamic_mods = dynamicTreeCut::cutreeHybrid(dendro = feat_hc, distM = dissTOM,
+                               deepSplit = deep, pamRespectsDendro = TRUE,
+                               minClusterSize = minModuleSize)
+  
+  
+  palette_generator <- colorRampPalette(tol_palettes$tol21)
+  
+  n_labels <- length(unique(dynamic_mods$labels))
+  label_colors <- palette_generator(n_labels)
+
+  if (!is.na(feat_modality)){
+    n_modalities <- length(unique(feat_modality))
+    modality_colors <- palette_generator(n_modalities)
+  }
+  
+  # define dendrocolors
+  if (all(is.na(feat_modality))){
+    dendrocolors <- data.frame(
+      module = labels2colors(
+        labels = dynamic_mods$labels,
+        colorSeq = label_colors)
+    )
+  } else {
+    dendrocolors <- data.frame(
+      module = labels2colors(
+        labels = dynamic_mods$labels,
+        colorSeq = label_colors),
+      modality = labels2colors(
+        feat_modality,
+        colorSeq = modality_colors)
+    )
+  }
+  
+  # browser()
+  # connectivity, after softpower-weighting
+  connectivity <- intramodularConnectivity.fromExpr(
+    datExpr = data,
+    colors = dendrocolors$module,
+    networkType = networktype,
+    corFnc = corfnc,
+    power=softpower,
+    getWholeNetworkConnectivity	=TRUE
+  )
+  
+  #cf Zhang2005, section 5: TOM-based conn outperformed standard conn with respond to significance of outcome association
+  TOM.connectivity <- intramodularConnectivity(
+    adjMat = TOM,
+    colors = dendrocolors$module,
+    # getWholeNetworkConnectivity	=TRUE  #not supported
+  )
+  
+  return(list(dendrocolors=dendrocolors, dynamic_mods=dynamic_mods, feat_hc=feat_hc, connectivity=connectivity, TOM.connectivity=TOM.connectivity))
+}
+
+
+create_dendro_color_png <- function(dendrocolors, feat_hc, fig_path, plt_t, feat_modality=NA){
+  
+  png(fig_path)
+  
+  if (ncol(dendrocolors)<2){
+    plotDendroAndColors(feat_hc, 
+                        dendrocolors, 
+                        # groupLabels = c("module", "modality"),
+                        dendroLabels = FALSE, hang = 0.03,
+                        addGuide = TRUE, guideHang = 0.05,
+                        autoColorHeight = FALSE, colorHeight = 0.1,
+                        main = plt_t)
+  } else {
+    plotDendroAndColors(feat_hc, 
+                        dendrocolors, 
+                        # groupLabels = c("module", "modality"),
+                        dendroLabels = FALSE, hang = 0.03,
+                        addGuide = TRUE, guideHang = 0.05,
+                        autoColorHeight = FALSE, colorHeight = 0.1,
+                        rowText = feat_modality,
+                        textPositions = 2,
+                        rowTextAlignment = "center",
+                        main = plt_t)
+  }
+  dev.off()
+}
+
+
+generate_dendro_module_plots <- function(pars, common_pars, create_plot=FALSE){
+  merge_pars_used_l <- list()
+  color_overview_l <- list()
+  connectivity_l <- list()
+  TOM.connectivity_l <- list()
+  for (i in 1:nrow(pars)){
+    print(i)
+    
+    iter_pars <- as.list(pars[i,])
+    list2env(c(common_pars, iter_pars), envir=environment())
+    fig_path <- glue("{figdir}/{data_name}_{corfnc}_{networktype}_power{softpower}_minsize{minModuleSize}_deepsplit{deep}.png")
+    plt_t <- glue("[{i}]{data_name}: {corfnc}/{networktype}/power {softpower}/minsize {minModuleSize}/deepsplit {deep}")
+    
+    # if(deep==4 & minModuleSize <= 10) browser()
+    module_data <- do.call(define_modules, c(common_pars, iter_pars))
+    
+    # browser()
+    if (create_plot)
+      create_dendro_color_png(module_data$dendrocolors, module_data$feat_hc,fig_path, plt_t, feat_modality)
+    # browser()
+    
+    if ("mergeCriteria" %in% names(module_data$dynamic_mods)){
+      merge_pars_used_l[[i]] <- do.call(rbind, module_data$dynamic_mods$mergeCriteria)
+    } else {   #no mergeCriteria returned by cutreeHybrid if all merges are below the cut
+      x <- matrix(rep(NA,4), nrow=4)
+      rownames(x) <- c("maxCoreScatter", "minGap", "maxAbsCoreScatter", "minAbsGap")
+      merge_pars_used_l[[i]] <- x
+    }
+    color_overview_l[[i]] <- module_data$dendrocolors
+    connectivity_l[[i]] <- module_data$connectivity
+    TOM.connectivity_l[[i]] <- module_data$TOM.connectivity
+    
+  }
+  # browser()
+  merge_pars_used <- do.call(cbind, merge_pars_used_l)  #see how deepsplit par was translated
+  color_overview <- do.call(cbind, color_overview_l) 
+  return(list(merge_pars_used=merge_pars_used, color_overview=color_overview, connectivity = connectivity_l, TOM.connectivity=TOM.connectivity_l))    
+}
+
+get_me_binary_associations <- function(eigengene_feature_assoc, dichvar){
+  # eigengene_feature_assoc: n_features_modindiv x n_me_modme matrix
+  
+  me_wilcox <- function(df) wilcox.test(formula=value~dichvar, data=df, conf.int=TRUE)
+  
+  # browser()
+  eigengene_feature_assoc %>%
+    as_tibble() %>%
+    dplyr::mutate(dichvar=dichvar) %>%
+    gather(ME, value, -dichvar) %>%
+    dplyr:: group_by(ME) %>%
+    nest() %>%
+    dplyr::mutate(
+      wilcox_res = map(data, me_wilcox),
+      wilcox_est = map_dbl(wilcox_res, "estimate"),
+      wilcox_p = map_dbl(wilcox_res, "p.value")
+    ) %>%
+    dplyr::select(-one_of(c("wilcox_res", "data")))
+    # gather(test_output, value) %>%
+    # spread(ME, value)
+}
+
+get_modme_modindiv_feature_associations <- function(eigengenes, modindiv){
+  
+  # remove data.table class
+  modindiv <- as.data.frame(modindiv)
+  
+  # eigengenes of module modme versus individual features of modindiv
+  eigengene_feature_assoc <- matrix(0, nrow = ncol(modindiv),
+                                    ncol = ncol(eigengenes))
+  rownames(eigengene_feature_assoc) <- names(modindiv)
+  colnames(eigengene_feature_assoc) <- names(eigengenes)
+  
+  n_me <- ncol(eigengenes)
+  for (i in seq_len(n_me)){
+    # browser()
+    me <- names(eigengenes)[i]
+    print(glue("calculating feature associations with ME: {me} [{i}/{n_me}]"))
+    for (feat in names(modindiv)){
+      #suppress warnings about exact pval with ties
+      suppressWarnings(
+        eigengene_feature_assoc[feat, me] <- cor.test(x=eigengenes[,me], 
+                                                      y=modindiv[,feat], 
+                                                      method = "spearman")$estimate)
+    }
+  }
+  eigengene_feature_assoc
+}
+
+get_modme_modindiv_cluster_associations <- function(eigengenes, modindiv, modindiv_clusters){
+  
+  # individual features of modinv -> correlation with modme eigengenes
+  eigengene_feature_assoc <- get_modme_modindiv_feature_associations(eigengenes, modindiv)
+  
+  # compare within- vs outside-of-cluster correlations
+  print(glue("comparing within- vs outside-of-cluster correlations"))
+  me_cluster_associations <- list()
+  n_clust <- n_distinct(modindiv_clusters)
+  for (i in seq_len(n_clust)){
+    clust <- unique(modindiv_clusters)[i]
+    print(glue("cluster: {clust} [{i}/{n_clust}]"))
+    cluster_indicator <- modindiv_clusters == clust
+    
+    # list (clusters) of lists (c(est, pval, p_star))
+    me_cluster_associations[[clust]] <- 
+      get_me_binary_associations(eigengene_feature_assoc, cluster_indicator)
+  }
+  
+  # browser()
+  est_m <- me_cluster_associations %>% 
+    map("wilcox_est") %>%
+    bind_rows() %>%
+    dplyr::mutate(ME = names(eigengenes)) %>%
+    column_to_rownames("ME") %>%
+    as.matrix()
+  
+  pval_m <- me_cluster_associations %>%
+    map("wilcox_p") %>% 
+    bind_rows() %>%
+    dplyr::mutate(ME = names(eigengenes)) %>%
+    column_to_rownames("ME") %>%
+    # dplyr::mutate_all(p.adjust, method="BH")%>%
+    as.matrix()
+  
+  pval_m <- matrix(p.adjust(pval_m, method="BH"),
+                   nrow = nrow(pval_m),
+                   ncol= ncol(pval_m),
+                   dimnames = list(rownames(pval_m),
+                                   colnames(pval_m)))
+  
+  p_star_m <- get_p_stars(pval_m)
+  
+  return(list(est_m=est_m, pval_m=pval_m, p_star_m=p_star_m))
+}
+
+clustering_pheno_assoc_search <- function(clustering_df, modality_data, y){
+  # clustering_df: features x cluster_par_sets
+  # modality_data: samples x features
+  # y: samples x outcomes
+  
+  clust_pheno_assoc_summ <- list()
+  for (i in 1:ncol(clustering_df)){
+    print(glue("Analysing clustering {i}/{ncol(clustering_df)}"))
+    clustering <- clustering_df[,i]
+    if (any(clustering != "grey")){
+      clust_eigen <- moduleEigengenes(modality_data, colors = clustering, nPC=10, impute = FALSE,
+                                      excludeGrey = TRUE, subHubs = FALSE, 
+                                      scale = FALSE)$eigengenes
+      clust_pheno_assoc_summ[[as.character(i)]] <- get_me_pheno_associations(clust_eigen, y)
+    }
+  }
+  
+  browser()
+  clust_pheno_assoc_summ_df <- clust_pheno_assoc_summ %>%
+    map("pval_m") %>%
+    map(~as_tibble(.x)) %>%
+    bind_rows(.id="clustering_i") %>%
+    dplyr:: group_by(clustering_i)
+  
+  cluster_count <- summarise(clust_pheno_assoc_summ_df, n_clusters = n())
+
+  clust_pheno_assoc_summ_df %>%
+    summarise_all(funs(n=sum(.<0.05),
+                       prop=mean(.<0.05))) %>% 
+    left_join(cluster_count) %>%
+    dplyr::mutate(clustering_i = as.numeric(clustering_i)) %>%
+    arrange(clustering_i)
+}
+
+
+get_p_stars <- function(p_m){
+  stars = matrix ("", ncol = ncol (p_m), nrow = nrow (p_m))
+  rownames (stars) = rownames (p_m)
+  colnames (stars) = colnames (p_m)
+  for (z in 1:ncol (stars)) {
+    for (j in 1:nrow (stars)) {
+      if (p_m [j, z] < 0.1) {
+        stars [j, z] = "+"
+      }
+      if (p_m [j, z] < 0.01) {
+        stars [j, z] = "*"
+      }
+      if (p_m [j, z] < 0.001) {
+        stars [j, z] = "**"
+      }
+    }
+  }
+  return(stars)
+}
+
+visualize_search <- function(search_output){
+  
+  #bar
+  bar <- search_output %>%
+    dplyr::select(-contains("prop")) %>%
+    gather(parameter, value, -clustering_i) %>%
+    dplyr::mutate(parameter = str_replace_all(parameter,
+                                          c("wilcox_"="", "spear_"="", "_p_"="_"))) %>% 
+    dplyr::mutate(parameter = factor(parameter, 
+                                     levels = c("n_clusters", "age_n", "sex_n", "statin_n",
+                                                "diab_n", "cvd_n", "hrcvd_n"))) %>%
+    ggplot(aes(x=reorder(clustering_i,-clustering_i), y=value, fill=parameter))+
+    geom_bar(stat = "identity", position = "dodge")
+  
+  # #heatmap
+  # hm <- search_output %>%
+  #   dplyr::select(-contains("prop")) %>%
+  #   gather(parameter, value, -clustering_i) %>%
+  #   dplyr::mutate(parameter = str_replace_all(parameter,
+  #                                         c("wilcox_"="", "spear_"="", "_p_"="_"))) %>% 
+  #   dplyr::mutate(parameter = factor(parameter, 
+  #                                    levels = c("n_clusters", "age_n", "sex_n", "statin_n",
+  #                                               "diab_n", "cvd_n", "hrcvd_n"))) %>%
+  #   ggplot(aes(x=reorder(clustering_i,-clustering_i), fill=value, y=parameter))+
+  #   geom_tile()+
+  #   geom_text(aes(label=value))+
+  #   scale_fill_gradient(low="white", high="red")
+  
+  # scale_x_continuous(breaks = search_output$clustering_i)
+  
+  # return(list(bar=bar,hm=hm))
+  return(bar)
+}
+
+
+pairwise_ME_cor <- function(row_mod, col_mod, pw_corfnc="spearman"){
+  
+  #debug
+  # row_mod <- protein_ms_me$eigengenes
+  # col_mod <- lipid_ms_me$eigengenes
+  
+  est_m <- matrix (0, nrow = ncol(row_mod), ncol = ncol(col_mod))
+  rownames(est_m) <- names(row_mod)
+  colnames(est_m) <- names(col_mod)
+  pval_m <- est_m
+  for (i in seq_along(row_mod)){
+    for (j in seq_along(col_mod)){
+      ME_A <- row_mod[[i]]
+      ME_B <- col_mod[[j]]
+      est_m[i,j] <- cor(ME_A, ME_B, method = pw_corfnc)
+      suppressWarnings(pval_m[i,j] <- 
+                         cor.test(ME_A, ME_B, method = pw_corfnc)$p.value)
+    }
+  }
+  # browser()
+  pval_m <- matrix(p.adjust(pval_m, method="BH"),
+                   nrow = nrow(pval_m),
+                   ncol= ncol(pval_m),
+                   dimnames = list(rownames(pval_m),
+                                   colnames(pval_m)))
+
+  p_star_m <- get_p_stars(pval_m)
+  return(list(est_m=est_m, pval_m=pval_m, p_star_m=p_star_m))
+}
+
+
+
+make_phenobar <- function(pheno_p, pheno_est, p_cutoff){
+  
+  ### make sidebar with phenotype associations
+  phenobar = matrix (NA, ncol = ncol(pheno_est), nrow=nrow(pheno_est))
+  colnames (phenobar) = colnames(pheno_est)
+  rownames (phenobar) = rownames(pheno_est)
+  
+  for (j in 1:ncol(pheno_est)) {
+    # tmp = p.adjust (pheno_p[ , j], method="BH") ### adjust column wise on phenotypes
+    # pheno_p is already BH-adjusted per phenotype
+    
+    # color interpretation:
+    # for wilcox (after inversion in get_me_pheno_associations): red -> 1 is higher
+    # spearman: red -> positive correlation
+    
+    for (k in 1:nrow(pheno_est)) {
+      if (pheno_p[k,j] >= p_cutoff) {
+        phenobar [k, j] = "grey"
+      } else {
+        if (pheno_est[k , j] < 0) {
+          phenobar [k, j] = "darkblue"
+        } else if (pheno_est[k , j] > 0){
+          phenobar[k, j] = "darkred"  
+        } else {
+          phenobar[k, j] = "white"
+        }
+      }
+    }
+  }
+  return(phenobar)
+}
+
+
+nmr_clust_enrich <- function(nmr_coding, lipid_nmr_cluster_indices){
+  clust_enrich <- list()
+  for (clust in unique(lipid_nmr_cluster_indices)){
+    
+    #debug
+    # clust <-"lnmr_215487"
+    
+    
+    members <- nmr_coding$feature_code[lipid_nmr_cluster_indices == clust]
+    members_long <- nmr_coding$long_code[lipid_nmr_cluster_indices == clust]
+    n_members <- length(members)
+    n_feat <- nrow(nmr_coding)
+    
+    anno_enrich <- c()
+    n_anno_total <- nmr_coding %>%
+      dplyr::select(-(1:3)) %>%
+      summarise_all(sum)
+    n_anno_clust <- nmr_coding %>%
+      dplyr::filter(feature_code %in% members) %>%
+      dplyr::select(-(1:3)) %>%
+      summarise_all(sum)
+    
+    anno_p_adj <- map2_dbl(
+      n_anno_clust,
+      n_anno_total,
+      ~1-phyper(q=.x, m=.y, n=n_feat-.y, k=n_members)) %>%
+      p.adjust(., method = "BH")
+    
+    anno_p_adj_order <- anno_p_adj %>%
+      .[order(.)]
+    
+    anno_enrich <- names(anno_p_adj_order)[anno_p_adj_order <0.05]
+    if ("apo" %in% anno_enrich){
+      apo_pos <- which(anno_enrich == "apo")
+      anno_enrich[apo_pos] <-str_extract(members, pattern = "^apo.*|^APO.*|^Apo.*") %>% na.omit(.)
+    }
+    
+    if (length(anno_enrich)==0){
+      anno_enrich <- sprintf("[%s]",names(anno_p_adj_order)[1])
+    }
+    
+    clust_enrich[[clust]] <- tibble(n = length(members),
+                                    tags=paste0(anno_enrich, collapse = "|"),
+                                    label=
+                                      sprintf("%s (%s): %s",
+                                              clust,
+                                              n_members, 
+                                              paste0(anno_enrich, collapse = "|")),
+                                    label_no_id = sprintf("(%s): %s",
+                                              n_members, 
+                                              paste0(anno_enrich, collapse = "|")),
+                                    members=paste0(members_long, collapse = ", "),
+                                    p_adj = list(anno_p_adj))
+  }
+  bind_rows(clust_enrich, .id = "cluster")%>%
+    mutate(tags = ifelse(str_detect(cluster, "grey"),"grey", tags))
+}
+
+ms_clust_enrich <- function(ms_coding, lipid_ms_cluster_indices){
+  clust_enrich <- list()
+  for (clust in unique(lipid_ms_cluster_indices)){
+    
+    # debug
+    # clust <- unique(lipid_ms_cluster_indices)[1]
+    
+    members <- ms_coding$lipid_ms_id[lipid_ms_cluster_indices == clust]
+    n_members <- length(members)
+    n_feat <- nrow(ms_coding)
+    
+    anno_enrich <- c()
+    n_anno_total <- ms_coding %>%
+      dplyr::select(-(1:7)) %>%
+      summarise_all(sum)
+    n_anno_clust <- ms_coding %>%
+      dplyr::filter(lipid_ms_id %in% members) %>%
+      dplyr::select(-(1:7)) %>%
+      summarise_all(sum)
+    
+    anno_p_adj <- map2_dbl(
+      n_anno_clust,
+      n_anno_total,
+      ~1-phyper(q=.x, m=.y, n=n_feat-.y, k=n_members)) %>%
+      p.adjust(., method = "BH")
+    
+    anno_p_adj_order <- anno_p_adj %>%
+      .[order(.)]
+    
+    anno_enrich <- names(anno_p_adj_order)[anno_p_adj_order <0.05]
+    
+    if (length(anno_enrich)==0){
+      anno_enrich <- sprintf("[%s]",names(anno_p_adj_order)[1])
+    }
+    
+    clust_enrich[[clust]] <- tibble(tags=paste0(anno_enrich, collapse = "|"),
+                                    label=
+                                      sprintf("%s (%s): %s",
+                                              clust,
+                                              n_members, 
+                                              paste0(anno_enrich, collapse = "|")),
+                                    members=paste0(members, collapse = ", "),
+                                    p_adj = list(anno_p_adj))
+  }
+  bind_rows(clust_enrich, .id = "cluster") %>%
+    mutate(tags = ifelse(str_detect(cluster, "grey"),"grey", tags))
+}
+
+map_cluster_colcode_to_anno <- function(colcodes, cluster_anno, cluster_anno_labelcol){
+  # colcodes can contain "_ME", clusteranno is always pure hexcode without "_ME"
+  
+  #debug
+  # cluster_anno <- nmr_cluster_anno
+  # colcodes <- rownames(lnmr_lms_pw_me$est_m)
+  
+  # if (n_distinct(str_detect(colcodes, "_ME"))>1)
+  #   stop("mixed cluster names/eigengene names")
+    
+  colcodes_hex <- tibble(colcodes=colcodes) %>%
+    mutate(colcodes=gsub(colcodes, pattern = "_ME", replacement = "_")) %>%
+    separate(colcodes, into = c("mod", "hexcode"))
+    # mutate(hexcode= map_chr(mod_hexcode, ~str_match(.x, "^[a-z]{2,3}(.*)")[[2]]))
+  
+  cluster_anno_sep <-  cluster_anno %>% 
+    separate(cluster, into = c("mod", "hexcode"))
+  
+  o <- match(colcodes_hex$hexcode, cluster_anno_sep$hexcode)
+  
+  anno <- cluster_anno_sep[[cluster_anno_labelcol]][o]
+  
+  anno
+}
+
+
+reorder_annotation_by_colcodes <- function(colcodes, cluster_anno){
+  # colcodes can contain "_ME", clusteranno is always pure hexcode without "_ME"
+  
+  #debug
+  # cluster_anno <- nmr_cluster_anno
+  # colcodes <- rownames(lnmr_lms_pw_me$est_m)
+  
+  # if (n_distinct(str_detect(colcodes, "_ME"))>1)
+  #   stop("mixed cluster names/eigengene names")
+    
+  colcodes_hex <- tibble(colcodes=colcodes) %>%
+    mutate(colcodes=gsub(colcodes, pattern = "_ME", replacement = "_")) %>%
+    separate(colcodes, into = c("mod", "hexcode"))
+    # mutate(hexcode= map_chr(mod_hexcode, ~str_match(.x, "^[a-z]{2,3}(.*)")[[2]]))
+  
+  cluster_anno_sep <-  cluster_anno %>% 
+    separate(cluster, into = c("mod", "hexcode"))
+  
+  o <- match(colcodes_hex$hexcode, cluster_anno_sep$hexcode)
+  
+  anno <- cbind(colcodes=colcodes,cluster_anno_sep[o,])
+  
+  anno
+}
+
+get_sc_composition <- function(member_clusters, bruneck, merged_cluster_indices, feat_modality){
+  # feat_modality: vector giving modality (NMR/lipid MS/protein MS) for each feature; length = ncol(bruneck)
+  # merged_cluster_indices: vector giving cluster for each feature; length = ncol(bruneck)
+  # member_cluster: char vector of clusters belonging to the supercluster
+  
+  HDL_sc <- tibble(feature = names(bruneck),
+                 cluster = merged_cluster_indices,
+                 modality = feat_modality) %>%
+  mutate(me_name = cluster %>% str_replace_all(c("lnmr_" = "lnmr_ME",
+                                                 "lms_" = "lms_ME"))) %>%
+  dplyr::filter(cluster %in% member_clusters)
+}
+
+
+get_loo_me_wilcox <- function(x, y){
+  # x: subjects x features; y: subjects x 1
+  # can be applied to:
+  #   - effect of cluster exclusion on association (supercluster PC1 - outcome)
+  #   - effect of feature exclusion on association (cluster PC1 - outcome)
+  
+  me_full <- moduleEigengenes(x, colors = rep(1, ncol(x)), nPC = 1, impute=FALSE,
+                   excludeGrey = TRUE, subHubs = FALSE, scale = FALSE)[["eigengenes"]] %>%
+    setNames("me_full")
+  
+  me_full_test <- me_full %>%
+    bind_cols(y) %>%
+    gather(outcome_var, outcome_value, one_of(names(y))) %>%
+    group_by(outcome_var) %>%
+    nest() %>%
+    mutate(fit = map(data, ~wilcox.test(formula=me_full~outcome_value, data=.x, conf.int=TRUE)),
+           tidyfit = map(fit, tidy)) %>%
+    dplyr::select(-one_of("fit", "data")) %>%
+    unnest() %>%
+    dplyr::select(outcome_var, estimate, p.value)
+  
+  
+  
+  me_loo_l <- list()
+  for (i in seq_along(x)){
+    nm <- names(x)[i]
+    loo_colors <- rep(1, ncol(x))
+    loo_colors[i] <- "grey"
+    me_loo_l[[nm]] <-  moduleEigengenes(x, colors = loo_colors, nPC = 1, impute=FALSE,
+                                        excludeGrey = TRUE, subHubs = FALSE, scale = FALSE)[["eigengenes"]] %>%
+      setNames(nm)
+  }
+  me_loo_df <- bind_cols(me_loo_l)
+  
+  # browser()
+  me_loo_df %>%
+    bind_cols(y) %>%
+    gather(col, col_loo_me, -one_of(names(y))) %>%
+    gather(outcome_var, outcome_value, one_of(names(y))) %>%
+    group_by(col, outcome_var) %>%
+    nest() %>%
+    mutate(fit = map(data, ~wilcox.test(formula=col_loo_me~outcome_value, data=.x, conf.int=TRUE)),
+           tidyfit = map(fit, tidy)) %>%
+    dplyr::select(-one_of("fit", "data")) %>%
+    unnest() %>%
+    dplyr::select(col, outcome_var, estimate, p.value) %>%
+    left_join(me_full_test, by="outcome_var", suffix = c("", "_full")) %>%
+    mutate(relative_diff_abs_estimate = (abs(.$estimate)-abs(.$estimate_full))/abs(.$estimate_full),  # = perc more extreme after dropping col
+           fold_p = p.value/p.value_full,
+           mlog_fold_p = -log10(fold_p))
+}
+
+
+
+
+LOO_analysis <- function(sc_composition, bruneck, me_merged, y){
+  
+  # sc_composition: supercluster composition
+  # bruneck:
+  # me_merged:
+  # y:
+  
+  
+  # member features LOO analysis -> effect on supercluster PC1 - outcome association
+  sc_feature_loo_me <- get_loo_me_wilcox(dplyr::select(bruneck, sc_composition$feature), dplyr::select(y, CVD0010, SEX, diabetes))
+  
+  # member clusters LOO analysis
+  sc_cluster_loo_me <- get_loo_me_wilcox(dplyr::select(me_merged, sc_composition$me_name), dplyr::select(y, CVD0010, SEX, diabetes))
+  
+  # member features LOO analysis per cluster
+  sc_feature_per_cluster_loo_me <- unique(sc_composition$cluster) %>%
+    set_names(.) %>% 
+    map(get_sc_composition) %>%
+    discard(~nrow(.x)<2) %>%
+    map(~get_loo_me_wilcox(dplyr::select(bruneck,.x$feature), dplyr::select(y, CVD0010, SEX, diabetes))) %>%
+    bind_rows(.id="cluster")
+  
+  
+  p_feature_loo <- sc_feature_loo_me %>%
+    gather(stat, value, relative_diff_abs_estimate, mlog_fold_p) %>%
+    ggplot(., aes(x=col, y=value, color=outcome_var))+
+    geom_point()+
+    coord_flip()+
+    geom_hline(yintercept = 0)+
+    facet_grid(.~stat, scales="free")+
+    xlab("left out")+
+    theme_bw()+
+    labs(title = "feature LOO effect on supercluster PC1 associations")
+  
+  p_cluster_loo <- sc_cluster_loo_me %>%
+    gather(stat, value, relative_diff_abs_estimate, mlog_fold_p) %>%
+    ggplot(., aes(x=col, y=value, color=outcome_var))+
+    geom_point()+
+    coord_flip()+
+    geom_hline(yintercept = 0)+
+    facet_grid(.~stat, scales="free")+
+    xlab("left out")+
+    theme_bw()+
+    labs(title = "cluster LOO effect on supercluster PC1 associations")
+  
+  p_feature_loo_per_cluster <- sc_feature_per_cluster_loo_me %>%
+    gather(stat, value, relative_diff_abs_estimate, mlog_fold_p) %>%
+    ggplot(., aes(x=col, y=value, color=outcome_var))+
+    geom_point()+
+    coord_flip()+
+    geom_hline(yintercept = 0)+
+    facet_grid(cluster~stat, scales="free", space = "free_y")+
+    xlab("left out")+
+    theme_bw()+
+    labs(title = "feature LOO effect on cluster PC1 associations")
+
+ return(list(p_feature_loo=p_feature_loo, p_cluster_loo=p_cluster_loo, p_feature_loo_per_cluster=p_feature_loo_per_cluster)) 
+}
+
+
+define_colors <- function(x, breaks = range(x, na.rm = TRUE), quant_colors = c("white", "darkgreen")){
+  if (is.numeric(x)){
+    # x_mod <- replace_na(x, max(x, na.rm = TRUE)+1)
+    # colorRamp2(breaks = c(range(x, na.rm = TRUE), max(x, na.rm = TRUE)+1), colors = c("white", "red"))(x)
+    colors <- colorRamp2(breaks = breaks, colors = quant_colors)
+  } else {
+    colors <- structure(ggplot_qual_colors(n_distinct(x)), names=unique(x))
+    # if (any(is.na(x)))
+    #   colors <- c(colors, "NA"= "grey")
+  }
+  colors
+}
+
+```
+
+
+
+
+```{r load-data}
+
+# read input ---------------------------------------------------------------
+# bruneck is merged, minmax-scaled and KNN imputed: 
+# see /home/simon/OneDrive/KCL/Mayr_proteomics/mayr-project/mayr_python/nmr_ms_mi.py
+bruneck <- fread("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data/bruneck_merged_minmax_imp.tsv")
+diabetes <- read_csv("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/bruneck/diabetes_characteristics_inputs.csv")
+statin <- readxl::read_xlsx("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/bruneck/statin_cvd_inputs.xlsx", na="#N/A")
+cvd <- fread("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data/bruneck_outcomes.tsv")
+nmr_varnames <- readxl::read_xlsx("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/bruneck/Bruneck2000NMRData_Cleaned.xlsx", sheet = "features description")
+names(nmr_varnames) <- names(nmr_varnames) %>% tolower(.) %>% gsub(., pattern = " ", replacement = "_")
+
+# create y ---------------------------------------------------------------
+y <- cvd %>% 
+  bind_cols(bruneck %>% dplyr::select(AGE, SEX)) %>%
+  mutate(HRCVD = as.numeric(CVD0010W < 52 & CVD0010 == 1)) %>%
+  rename("Bruneckcode" = "Lipids Bruneckcode") %>%
+  inner_join(statin %>% select(statin = "Statin Mapping", Bruneckcode)) %>%
+  inner_join(diabetes %>% select(diabetes = "Diabetes Marker", Bruneckcode))
+  # dplyr::select(-CVD0010W)
+
+
+
+
+# create X ---------------------------------------------------------------
+bruneck <- bruneck %>% dplyr::select(-one_of("AGE", "SEX"))
+names(bruneck) <- names(bruneck) %>% gsub(pattern = "_HUMAN", replacement = "")
+feat_modality <- c(
+  rep("lipid_ms", 138),
+  rep("clinical", 4),
+  rep("lipid_nmr", 226),
+  rep("protein_ms", 97)
+)
+
+## re-separate individual modalities (after pre-processing steps in python)
+lipid_ms <- bruneck[, c(FALSE, feat_modality=="lipid_ms"), with=FALSE]
+lipid_nmr <- bruneck[, c(FALSE, feat_modality=="lipid_nmr"), with=FALSE]++
+protein_ms <- bruneck[, c(FALSE, feat_modality=="protein_ms"), with=FALSE]
+clinical <- bruneck[, c(FALSE, feat_modality=="clinical"), with=FALSE]
+
+## drop some features
+# restrict protein_ms to apolipoproteins
+# names(protein_ms)
+protein_ms <- protein_ms %>% dplyr::select(matches("^APO"))
+# drop small molecules from lipid_nmr
+lipid_nmr <- lipid_nmr %>% dplyr::select(XXLVLDLP:SFAFA)
+
+
+## rebuild bruneck with remaining features
+bruneck <- cbind(lipid_ms, clinical, lipid_nmr, protein_ms)
+feat_modality <- c(
+  rep("lipid_ms", ncol(lipid_ms)),
+  rep("clinical", ncol(clinical)),
+  rep("lipid_nmr", ncol(lipid_nmr)),
+  rep("protein_ms", ncol(protein_ms))
+)
+
+# PCSK9 saphir
+saphir_apo <- read_csv("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/saphir_PCSK9/OmicsSaphire_agilent_for_simon.csv") %>%
+  set_names(c("id", names(.)[-1] %>% str_replace("_Agi", ""))) %>%
+  mutate(id = as.character(id))
+saphir_y <- readxl::read_excel("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/saphir_PCSK9/saphir outcome data_for_simon.xlsx") %>%
+  set_names(c("id", "age", "sex", "cvd", "cvdw_days")) %>%
+  mutate(id = as.character(id))
+saphir_pcsk9 <- readxl::read_excel("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/input_data/saphir_PCSK9/PCSK9 ELISA SAPHIR_for_simon.xlsx") %>%
+  set_names(c("id", "PCSK9")) %>%
+  mutate(id = as.character(id),
+         logPCSK9 = log(PCSK9))
+
+saphir <- saphir_apo %>%
+  inner_join(dplyr::select(saphir_pcsk9, -PCSK9)) %>%
+  inner_join(saphir_pcsk9) %>%
+  mutate_if(is.numeric, scale_min_max)
+
+```
+
+```{r ms-compounds }
+lipid_ms_compounds <- data.frame(lipid_ms_id=names(lipid_ms ))
+```
+
+```{r explore-saphir}
+dim(saphir_apo)
+dim(saphir_y)
+dim(saphir_pcsk9)
+
+scale_min_max <- function(x){
+  xmin <- min(x, na.rm=TRUE)
+  xmax <- max(x, na.rm=TRUE)
+  (x-xmin)/(xmax-xmin)
+}
+
+#ids in X and y in same order
+all(saphir$id == saphir_y$id)
+
+# same set of apo MS measurements in Bruneck and Saphir
+base::setdiff(names(protein_ms), names(saphir_apo))
+base::setdiff(names(saphir_apo), names(protein_ms))
+```
+
+
+```{r input-sanity-checks}
+head(y)
+head(diabetes)
+head(statin)
+
+map_dbl(y, ~sum(is.na(.)))  #7 NAs in statin
+
+merge(y, diabetes, by.x = "Bruneckcode", by.y="Bruneckcode", suffixes = c("_y", "_diab")) %>% 
+  # summarise(age_ok = all(.$AGE_y == .$AGE_diab),
+            # sex_ok = all(.$SEX == .$SEX_diab),)
+  filter((AGE_y != AGE_diab) | (SEX_y != SEX_diab))
+  # 
+merge(y, statin, by.x = "Bruneckcode", by.y="Bruneckcode") %>% summarise(ok = all(.$CVD0010==.$CVD))
+
+
+rm(statin)
+rm(diabetes)
+rm(cvd)
+
+```
+
+
+# Lipid ID mapping 
+
+## LipidMaps
+
+```{r setup-mapping}
+
+lipidmaps_params <- read_ods("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data/lipid_maps_identifier_loopup.ods",
+                             sheet = "clean_parameter_table") %>%
+  mutate(alkyl= replace_na(str_detect(modifiers, pattern = "alkyl"),FALSE))
+names(lipidmaps_params) <- names(lipidmaps_params) %>%
+  tolower(.) %>%
+  gsub(.,pattern = " ", replacement = "_")
+
+lipid_ms_compounds_lm <- lipid_ms_compounds %>%
+  mutate(stegemann2014_prefix =str_extract(lipid_ms_id, pattern = "^[:alpha:]+"),
+         alkyl =  str_detect(lipid_ms_id, "O")) %>%
+  left_join(lipidmaps_params)
+
+```
+
+
+
+```{r get-LipidMaps-mapping}
+# see /home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data/lipid_maps_identifier_loopup.ods
+# https://www.lipidmaps.org/data/structure/programmaticaccess.html
+# Lipidmaps classification and notation: Fahy2005 & Fahy2009
+# MS-level lipid notation: Liebisch2013
+# corresponding data description: Stegemann2014
+
+# lipidmaps_anno <- list()
+# for (i in 1:nrow(lipid_ms_compounds_lm)){
+#   lipid_ms_id <- as.character(lipid_ms_compounds_lm$lipid_ms_id[i])
+#   print(lipid_ms_id)
+# 
+#   name <- lipid_ms_id %>%
+#     sub(.,pattern = "_O", replacement = "_O_") %>%
+#     sub(., pattern = "TAG", replacement = "TG")
+#   prefix <- lipid_ms_compounds_lm$stegemann2014_prefix[i]
+#   subclass_code <- lipid_ms_compounds_lm$subclass_code[i]
+# 
+# 
+#   query_params <- list(
+#         Mode="ProcessTextOntologySearch",
+#         OutputMode = "File",
+#         OutputType = "CSV",
+#         OutputQuote = "Yes",
+#         Name=name,
+#         SubClass=subclass_code)
+# 
+#   if (prefix != "PS"){  # API does not work with #c and #db for phosposphingolipids
+#     n_carbons <- str_split(name,pattern = "_")[[1]][2]
+#     n_double_bonds <- str_split(name,pattern = "_")[[1]][3]
+#     query_params <- c(query_params, list(
+#       OntologyParamname1 = "carbons",
+#       OntologyParamModifier = "eq",
+#       OntologyParamValue1 = n_carbons,
+#       OntologyParamname2 = "doublebonds",
+#       OntologyParamModifier = "eq",
+#       OntologyParamValue2 = n_double_bonds))
+#   }
+# 
+#   params <- list(
+#     hostname = "lipidmaps.org/data/structure/LMSDSearch.php",
+#     scheme = "https",
+#     query = query_params)
+#   class(params)<-"url"
+#   request <- build_url(params)
+#   # system("wget -O {fp} {request}")
+# 
+#   getdata <- httr::GET(request)
+#   lipidmaps_anno[[lipid_ms_id]] <- as_tibble(httr::content(getdata, type = "text/csv"))
+# }
+# lipidmaps_anno_df <- bind_rows(lipidmaps_anno, .id = "lipid_ms_id")
+# write_tsv(lipidmaps_anno_df, glue("{datadir}/lipidmaps_anno_df.tsv"))
+
+```
+
+
+```{r assess-mapping}
+
+lipidmaps_anno_df <- read_tsv(glue("{datadir}/lipidmaps_anno_df.tsv"))
+
+lipidmaps_anno_df %>%
+  count(lipid_ms_id) %>% 
+  right_join(lipid_ms_compounds_lm)%>% 
+  arrange(desc(n)) %>% 
+  View(.)
+
+# 4 lipid species without LipidMaps ID (confirmed by manual search)
+setdiff(lipid_ms_compounds_lm$lipid_ms_id, lipidmaps_anno_df$lipid_ms_id)
+#  "SM_d18_1_22_2" "PC_O42_5"      "CE_24_0"       "CE_26_5" 
+
+```
+
+
+
+```{r most-inflated-lipid-classes}
+
+lipidmaps_anno_df %>%
+  count(lipid_ms_id) %>% 
+  right_join(lipid_ms_compounds_lm)%>% 
+  drop_na(n) %>%
+  ggplot(aes(x=reorder(stegemann2014_prefix, -n, median), y=n, color=factor(number_of_radyls)))+
+  geom_boxplot()+
+  xlab("lipid class")+
+  ylab("#LipidMaps IDs per MS lipid species")+
+  scale_color_discrete(name="radyls")
+ggsave(glue("{figdir}/lipidmaps_inflation.png"))
+```
+
+# data exploration
+
+```{r data exploration}
+
+bruneck_summ <- bruneck %>%
+  map(~summary(.)) %>%
+  bind_cols() %>%
+  mutate(stat=c("min","q1","median","mean","q3","max")) %>%
+  select(stat, everything())
+
+apply(bruneck[,-1], FUN=var, MARGIN=2) %>% melt() %>% rownames_to_column() %>% arrange(value)
+
+bruneck_hist <- bruneck %>%
+  # dplyr::select(1:10)%>%
+  melt() %>%
+  ggplot(aes(x=value))+
+  geom_histogram()+
+  facet_wrap(~variable, scales = "free_y")+
+  theme(strip.text.x = element_text(size = 6),
+        axis.text.x = element_text(size=6, angle=90),
+        axis.text.y = element_text(size=4))
+
+ggsave(bruneck_hist, filename = file.path(figdir,"bruneck_hist.png"), device="png", dpi = "retina", width = 40, height = 40, units = "cm")
+
+```
+
+```{r corrplots}
+col2 <- colorRampPalette(c("#67001F", "#B2182B", "#D6604D", "#F4A582",
+                           "#FDDBC7", "#FFFFFF", "#D1E5F0", "#92C5DE",
+                           "#4393C3", "#2166AC", "#053061"))
+
+#high-dim: lipids
+for (i in 1:2){
+  modality = c("lipid_ms", "lipid_nmr")[i]
+  data = list(lipid_ms, lipid_nmr, protein_ms)[[i]]
+  data_sp <- stats::cor(data, method = "spearman")
+  png(glue("{figdir}/{modality}_corrplot.png"), width = 20, height=20, res=1000, units = "cm")
+  corrplot(data_sp, order = "hclust", hclust.method = "average", method = "color", tl.cex = 0.2, col = rev(col2(500)), type = "upper")
+  dev.off()
+}
+
+
+#low-dim: proteins
+data_sp <- stats::cor(protein_ms, method = "spearman")
+png(glue("{figdir}/{modality}_corrplot.png"), width = 20, height=20, res=1000, units = "cm")
+corrplot(data_sp, order = "hclust", hclust.method = "average", method = "color", tl.cex = 0.9, col = rev(col2(500)), type = "upper")
+dev.off()
+
+```
+
+
+```{r outliers}
+sampleTree = hclust(dist(bruneck), method = "average")
+plot(sampleTree, main = "Sample clustering to detect outliers - average", sub="", xlab="", cex.lab = 1.5,
+     cex.axis = 1.5, cex.main = 2, cex=0.5)
+
+
+sampleTree_ward = hclust(dist(bruneck), method = "ward")
+plot(sampleTree_ward, main = "Sample clustering to detect outliers - ward", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2, cex=0.5)
+
+
+sampleTree_single = hclust(dist(bruneck), method = "single")
+plot(sampleTree_single, main = "Sample clustering to detect outliers - single", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2, cex=0.5)
+
+
+sampleTree_complete = hclust(dist(bruneck), method = "complete")
+plot(sampleTree_complete, main = "Sample clustering to detect outliers - complete", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2, cex=0.5)
+```
+
+# Network construction
+
+
+## Protein MS
+
+```{r power-parameter}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+common_pars <- list(data=protein_ms, verbose= 0,  moreNetworkConcepts = TRUE, powerVector = powers)
+pars <- expand.grid(networktype = c('signed', 'signed hybrid', 'unsigned'),
+            corFnc = c('cor', 'bicor'),
+            stringsAsFactors = FALSE)
+
+protein_ms_out <- optimize_network_pars(common_pars, pars, powers, plt_title = "Protein MS")
+View(protein_ms_out$sft_df)
+png(file.path(figdir,"WGCNA_pars/protein_ms_rsq.png"))
+protein_ms_out$p_rsq
+dev.off()
+protein_ms_out$p_k
+
+#low rsq with power distribution (scale free topology): because not independent entities but related measurements?
+```
+
+```{r parameter-exploration}
+protein_ms_common_pars <- list(data=protein_ms, data_name="protein_ms", figdir=file.path(figdir,"WGCNA_pars/"))
+protein_ms_pars <- data.frame(
+  softpower = c(6, 8, 3, 9, 14, 6, 8, 8, 3, 3, 8, 8, 8, 8,
+                3, 6, 8, 3),
+  corfnc = c("cor", "cor", "cor", "bicor", "bicor", "bicor", "cor", "cor", "cor", "cor", "cor", "cor", "cor", "cor",
+             "cor", "cor", "cor", "bicor"),
+  networktype = c("signed hybrid", "signed", "signed hybrid", "signed", "signed", "signed hybrid", "signed", "signed", "signed hybrid", "signed hybrid", "signed", "signed", "signed", "signed",
+                  "signed hybrid", "signed hybrid", "signed", "signed hybrid"),
+  method = c("average"),
+  minModuleSize = c(20, 20, 20, 20, 20, 20, 10, 10, 10, 10, 5, 15, 20, 5, 3, 3, 3, 3), 
+  deep = c(4, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 1, 4, 4, 4, 4),
+  stringsAsFactors = FALSE
+)
+
+# protein_ms_module_stats <- generate_dendro_module_plots(protein_ms_pars, protein_ms_common_pars, create_plot = FALSE)
+protein_ms_module_stats <- generate_dendro_module_plots(protein_ms_pars, protein_ms_common_pars, create_plot = TRUE)
+
+
+# cluster protein_ms without WGCNA softpower weighting?
+
+```
+
+
+## Lipid MS
+
+```{r power-parameter}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+common_pars <- list(data=lipid_ms, verbose= 0,  moreNetworkConcepts = TRUE, powerVector = powers)
+pars <- expand.grid(networktype = c('signed', 'signed hybrid', 'unsigned'),
+            corFnc = c('cor', 'bicor'),
+            stringsAsFactors = FALSE)
+
+lipid_ms_out <- optimize_network_pars(common_pars, iter_pars, powers, plt_title = "Lipid MS")
+View(lipid_ms_out$sft_df)
+png(file.path(figdir,"WGCNA_pars/lipid_ms_rsq.png"))
+lipid_ms_out$p_rsq
+dev.off()
+lipid_ms_out$p_k
+
+```
+
+```{r parameter-exploration}
+lipid_ms_common_pars <- list(data=lipid_ms, data_name="lipid_ms", figdir=file.path(figdir,"WGCNA_pars/"))
+lipid_ms_pars <- read_tsv(glue("{cluster_pars_dir}/lipid_ms_pars.tsv"))
+
+# undebug(generate_dendro_module_plots)
+
+lipid_ms_module_stats <- generate_dendro_module_plots(lipid_ms_pars, lipid_ms_common_pars, create_plot = FALSE)
+
+# lipid_ms_module_stats <- generate_dendro_module_plots(lipid_ms_pars, lipid_ms_common_pars, create_plot = TRUE)
+
+```
+
+
+## Lipid NMR
+
+```{r power-parameter}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+common_pars <- list(data=lipid_nmr, verbose= 0,  moreNetworkConcepts = TRUE, powerVector = powers)
+pars <- expand.grid(networktype = c('signed', 'signed hybrid', 'unsigned'),
+            corFnc = c('cor', 'bicor'),
+            stringsAsFactors = FALSE)
+
+lipid_nmr_out <- optimize_network_pars(common_pars, pars, powers, plt_title = "Lipid NMR")
+# View(lipid_nmr_out$sft_df)
+png(file.path(figdir,"WGCNA_pars/lipid_nmr_rsq.png"))
+lipid_nmr_out$p_rsq+
+  ylab("r squared")+
+  xlab("softpower")+
+  labs(title = "")
+dev.off()
+lipid_nmr_out$p_k
+```
+
+
+```{r parameter-exploration}
+lipid_nmr_common_pars <- list(data=lipid_nmr, data_name="lipid_nmr_noAA", figdir=file.path(figdir,"WGCNA_pars/"))
+lipid_nmr_pars <- read_tsv(glue("{cluster_pars_dir}/lipid_nmr_pars.tsv")) %>%
+  dplyr::select(-aim)
+
+
+lipid_nmr_module_stats <- generate_dendro_module_plots(lipid_nmr_pars, lipid_nmr_common_pars, create_plot = TRUE)
+# lipid_nmr_module_stats <- generate_dendro_module_plots(lipid_nmr_pars, lipid_nmr_common_pars, create_plot = TRUE)
+# lipid_nmr_module_stats$connectivity
+```
+
+
+
+## Merged modalities
+
+```{r power-parameter}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+common_pars <- list(data=bruneck[,-1], verbose= 0,  moreNetworkConcepts = TRUE, powerVector = powers)
+pars <- expand.grid(networktype = c('signed', 'signed hybrid', 'unsigned'),
+            corFnc = c('cor', 'bicor'),
+            stringsAsFactors = FALSE)
+
+merged_out <- optimize_network_pars(common_pars, pars, powers, plt_title = "merged")
+View(merged_out$sft_df)
+png(file.path(figdir,"WGCNA_pars/merged_rsq.png"))
+merged_out$p_rsq
+dev.off()
+merged_out$p_k
+
+#low rsq with power distribution (scale free topology): because not independent entities but related measurements?
+```
+
+```{r parameter-exploration}
+merged_common_pars <- list(data=bruneck, data_name="merged", 
+                           figdir=file.path(figdir,"WGCNA_pars/"), 
+                           feat_modality = feat_modality)
+merged_pars <- data.frame(
+  softpower = c(6,10,2, 12, 5, 5, 6, 6, 6,12,12,12),
+  corfnc = c("bicor","cor", "bicor", "bicor", "cor", "bicor", "bicor", 
+             "bicor", "bicor", "bicor", "bicor", "bicor"),
+  networktype = 
+    c("unsigned", "signed", "unsigned", "signed", "signed", "signed",
+      "unsigned", "unsigned", "unsigned", "signed", "signed", "signed"),
+  method = c("average"),
+  minModuleSize = c(20,20,20,20,20,20,20,10,10,20,10,10), 
+  deep = c(1,1,1,1,1,1,2,1,2,2,1,2),
+  stringsAsFactors = FALSE
+)
+
+merged_module_stats <- generate_dendro_module_plots(merged_pars, merged_common_pars, create_plot = FALSE)
+# merged_module_stats <- generate_dendro_module_plots(merged_pars, merged_common_pars, create_plot = TRUE)
+
+```
+## Parameter selection
+
+### Connectivity
+
+```{r module-quality-k}
+
+p_nmr_k <- lipid_nmr_module_stats[c("connectivity", "TOM.connectivity")] %>%
+  map(~map(.x, ~as_tibble(.x) %>%
+             mutate(kProp=kWithin/kTotal) %>%
+             summarise(mean_kProp = mean(kProp, na.rm = TRUE))
+                       # overall_prop = sum(kWithin,na.rm = TRUE)/sum(kTotal-kWithin, na.rm=TRUE))
+           )) %>%
+  map(~bind_rows(.x)) %>%
+  bind_cols() %>%
+  set_names(c("k", "k.TOM")) %>%
+  rownames_to_column(var="index") %>%
+  mutate(index=as.numeric(index)) %>%
+  gather(k_type, k, -index) %>%
+  dplyr::filter(index > 9) %>%
+  ggplot(aes(x=reorder(index, -index), y=k,
+             fill=factor(k_type, levels = c("k.TOM", "k")),
+             group=factor(k_type, levels = c("k.TOM", "k"))))+
+  theme_bw()+
+  geom_bar(stat="identity", position = "dodge", width = 0.7)+
+  # scale_x_discrete(limits=10:nrow(lipid_nmr_pars))+
+  # labs(title="connectivity")+
+  scale_fill_discrete("connectivity")+
+  coord_flip()+
+  ylab("mean(k_within/k_total)")+
+  xlab("")+
+  theme(
+    legend.position = "top",
+    axis.text.y = element_blank(),
+    axis.title.x = element_text(size=20),
+    axis.text.x = element_text(size=20),
+    plot.title = element_text(size=20),
+    legend.key.size = unit(15, "mm"),
+    legend.text = element_text(size=20),
+    legend.title = element_text(size=20),
+  )
+
+```
+
+### Module-phenotype assoc search
+
+
+```{r search-module-pheno-assoc}
+
+lipid_ms_search <- clustering_pheno_assoc_search(lipid_ms_module_stats$color_overview, lipid_ms, y)
+lipid_nmr_search <- clustering_pheno_assoc_search(lipid_nmr_module_stats$color_overview, lipid_nmr, y)
+# protein_ms_search <- clustering_pheno_assoc_search(protein_ms_module_stats$color_overview, protein_ms, y)
+merged_search <- clustering_pheno_assoc_search(merged_module_stats$color_overview, bruneck, y)
+
+# debug(visualize_search)
+
+visualize_search(lipid_ms_search) + labs(title = "lipid ms")+
+  theme(legend.position =c(0.2,0.7))
+visualize_search(lipid_nmr_search)+ labs(title = "lipid nmr")+
+  theme(legend.position =c(0.2,0.7))
+# visualize_search(protein_ms_search)+ labs(title = "protein ms")+
+#   theme(legend.position =c(0.2,0.7))
+visualize_search(merged_search)+ labs(title = "merged")+
+  theme(legend.position =c(0.37,0.9), legend.direction = "horizontal")
+
+p_nmr_assoc <-
+  lipid_nmr_search[10:23,c("clustering_i","n_clusters", "wilcox_cvd_p_n")] %>%
+  dplyr::rename("cvd_associated"="wilcox_cvd_p_n", "total"="n_clusters") %>%
+  gather(parameter, n, -clustering_i) %>%
+  ggplot(aes(x=reorder(clustering_i,-clustering_i), y=n, fill=parameter))+
+  theme_bw()+
+  geom_bar(stat="identity", position = "dodge", width = 0.7)+
+  # labs(title = "clusters")+
+  # theme(legend.position =c(0.2,0.7))+
+  coord_flip()+
+  ylab("number of clusters")+
+  xlab("")+
+  scale_fill_discrete("clusters", h.start = 140)+
+  theme(
+    legend.position = "top",
+    axis.text.y = element_blank(),
+    axis.title.x = element_text(size=20),
+    axis.text.x = element_text(size=20),
+    plot.title = element_text(size=20),
+    legend.key.size = unit(15, "mm"),
+    legend.text = element_text(size=20),
+    legend.title = element_text(size=20),
+  )
+
+
+
+```
+
+```{r nmr-par-selection-overview}
+p_nmr_par_overview <- plot_grid(p_nmr_k, p_nmr_assoc, ncol = 2)
+save_plot(plot=p_nmr_par_overview,
+          filename=glue("{figdir}/nmr_par_selection_overview_large.png"),
+          base_height = 10,
+          base_width = 12)
+```
+
+
+### Select modules
+
+```{r select-module-eigengenes}
+
+# choose clustering
+# lipid_nmr_cluster_index <- 12  
+#   # largest n_cvd which is located at kink and preserves large cluster
+
+lipid_nmr_cluster_index <- 11
+  # least number of very large clusters among signed networks
+lipid_nmr_cluster_index_hybrid <- 21
+  # best ratio n_cvd/n_clusters, best connectivity, signed hybrid for interpretation
+
+lipid_ms_cluster_index <- 12
+  # best ratio n_cvd/n_clusters
+
+protein_ms_cluster_index <- 16
+  # sparse, signed hybrid in context of low abs corr, good balance n_cvd,n_hrcvd,n_clusters
+
+
+# parameters choosen
+lipid_nmr_pars[lipid_nmr_cluster_index,]
+lipid_nmr_pars[lipid_nmr_cluster_index_hybrid,]
+lipid_ms_pars[lipid_ms_cluster_index,]
+
+
+
+```
+
+#### Modules
+
+```{r cluster-indices}
+# compute cluster indices
+
+#WGCNA
+lipid_ms_cluster_indices_wgcna <- recode_color_label(
+  lipid_ms_module_stats$color_overview[, lipid_ms_cluster_index],
+  "lms")
+lipid_nmr_cluster_indices_wgcna <- recode_color_label(
+  lipid_nmr_module_stats$color_overview[, lipid_nmr_cluster_index],
+  "lnmr")
+lipid_nmr_cluster_indices_wgcna_hybrid <- recode_color_label(
+  lipid_nmr_module_stats$color_overview[, lipid_nmr_cluster_index_hybrid],
+  "lnmr")
+
+
+#SPECTRAL
+lipid_ms_cluster_indices_spectral <- read_csv("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data/lipid_ms_spectral_cluster_labels.csv", col_names = c("feature", "label")) %>%
+  mutate(label= paste0(label + 1))
+
+lipid_nmr_cluster_indices_spectral <- read_csv("/home/simon/OneDrive/KCL/Mayr_proteomics/multi-omics-project/data/lipid_nmr_spectral_cluster_labels.csv", col_names = c("feature", "label"))%>%
+  mutate(label= paste0(label + 1))
+
+# table(lipid_nmr_cluster_indices_spectral$label)
+# table(lipid_ms_cluster_indices_spectral$label)
+# View(lipid_ms_cluster_indices_spectral)
+
+```
+
+
+
+#### Module eigengenes
+
+```{r WGCNA-MEs}
+
+#lipid ms
+lipid_ms_me_wgcna <- moduleEigengenes(
+  lipid_ms, 
+  colors = lipid_ms_module_stats$color_overview[, lipid_ms_cluster_index], 
+  nPC=10, impute = FALSE,
+  excludeGrey = FALSE, subHubs = FALSE, 
+  scale = FALSE)
+names(lipid_ms_me_wgcna$eigengenes) <-  recode_color_label(names(lipid_ms_me_wgcna$eigengenes),
+                                                     "lms")
+
+# lipid nmr
+# saveRDS(lipid_nmr_me_wgcna, glue("{datadir}/lipid_nmr_me_wgcna_inclAA.RDS"))
+lipid_nmr_me_wgcna  <- moduleEigengenes(
+  lipid_nmr, 
+  colors = lipid_nmr_module_stats$color_overview[, lipid_nmr_cluster_index], 
+  nPC=10, impute = FALSE,
+  excludeGrey = FALSE, subHubs = FALSE, 
+  scale = FALSE)
+names(lipid_nmr_me_wgcna$eigengenes) <-  recode_color_label(names(lipid_nmr_me_wgcna$eigengenes),
+                                                     "lnmr")
+
+lipid_nmr_me_wgcna_hybrid  <- moduleEigengenes(
+  lipid_nmr, 
+  colors = lipid_nmr_module_stats$color_overview[, lipid_nmr_cluster_index_hybrid], 
+  nPC=10, impute = FALSE,
+  excludeGrey = FALSE, subHubs = FALSE, 
+  scale = FALSE)
+names(lipid_nmr_me_wgcna_hybrid$eigengenes) <-  recode_color_label(
+  names(lipid_nmr_me_wgcna_hybrid$eigengenes),
+  "lnmr")
+
+#protein ms
+# protein_ms_me_wgcna  <- moduleEigengenes(
+#   protein_ms, 
+#   colors = protein_ms_module_stats$color_overview[, protein_ms_cluster_index], 
+#   nPC=10, impute = FALSE,
+#   excludeGrey = FALSE, subHubs = FALSE, 
+#   scale = FALSE)
+# names(protein_ms_me_wgcna$eigengenes) <-  recode_color_label(names(protein_ms_me_wgcna$eigengenes),
+#                                                      "pms")
+
+
+
+```
+
+```{r spectral-cluster-MEs}
+
+# TODO should be rerun on optimal signed NMR network (index 11 instead of index 12)
+
+# lipid_nmr_me_spectral <- moduleEigengenes(
+#   lipid_nmr,
+#   colors = lipid_nmr_cluster_indices_spectral$label,
+#   nPC=10, impute = FALSE,
+#   excludeGrey = FALSE, subHubs = FALSE, 
+#   scale = FALSE)
+# 
+# lipid_ms_me_spectral <- moduleEigengenes(
+#   lipid_ms,
+#   colors = lipid_ms_cluster_indices_spectral$label,
+#   nPC=10, impute = FALSE,
+#   excludeGrey = FALSE, subHubs = FALSE, 
+#   scale = FALSE)
+
+# lipid_nmr_me_spectral$eigengenes
+```
+
+
+
+#### export TOM at optimal pars (for alternative clustering)
+
+```{r TOM}
+
+lipid_nmr_optTOM <- build_TOM_opt_par(cluster_index = lipid_nmr_cluster_index, 
+                                      data = lipid_nmr, pars = lipid_nmr_pars)
+
+lipid_ms_optTOM <- build_TOM_opt_par(cluster_index = lipid_ms_cluster_index, 
+                                      data = lipid_ms, pars = lipid_ms_pars)
+
+protein_ms_optTOM <- build_TOM_opt_par(cluster_index = protein_ms_cluster_index, 
+                                      data = protein_ms, pars = protein_ms_pars)
+
+lipid_nmr_optTOM %>% as_data_frame() %>%
+  set_names(names(bruneck)[feat_modality=="lipid_nmr"]) %>%
+  write_csv("data/lipid_nmr_optTOM.csv", col_names = TRUE)
+
+lipid_ms_optTOM %>% as_data_frame() %>%
+  set_names(names(bruneck)[feat_modality=="lipid_ms"]) %>%
+  write_csv("data/lipid_ms_optTOM.csv", col_names = TRUE)
+protein_ms_optTOM %>% as_data_frame() %>%
+  set_names(names(bruneck)[feat_modality=="protein_ms"]) %>%
+  write_csv("data/protein_ms_optTOM.csv", col_names = TRUE)
+
+```
+
+
+
+
+
+# Cluster enrichment annotatation
+
+## NMR clusters
+
+```{r nmr-coding}
+nmr_coding <- tibble(feature_code=names(lipid_nmr)) %>%
+  left_join(nmr_varnames[]) %>%
+  mutate(
+    XXL = str_detect(long_code, "XXL-"),
+    XL = str_detect(long_code, "^XL-"),
+    L = str_detect(long_code, "^L-"),
+    M = str_detect(long_code, "M-"),
+    S = str_detect(long_code, "^S-"),
+    XS = str_detect(long_code, "XS-"),
+    HDL = str_detect(long_code, "HDL"),
+    IDL = str_detect(long_code, "IDL"),
+    LDL = str_detect(long_code, "-LDL")|str_detect(long_code, "^LDL") ,
+    VLDL = str_detect(long_code, "-VLDL") |str_detect(long_code, "^VLDL") ,
+    P = str_detect(long_code, "-P[_%]{0,2}$"),
+    Lipids = str_detect(long_code, "-L$"),
+    PL = str_detect(long_code, "-PL[_%]{0,2}$"),
+    C = str_detect(long_code, "-C[_%]{0,2}$") | long_code %in% c("EstC", "FreeC"),
+    CE = str_detect(long_code, "-CE[_%]{0,2}$"),
+    FC = str_detect(long_code, "-FC[_%]{0,2}$"),
+    TG = str_detect(long_code, "-TG[_%]{0,2}$")|str_detect(long_code, "^TG") ,
+    frac = str_detect(long_code, "%"),
+    dummy = TRUE
+  ) %>%
+  spread(feat_type_simon, dummy, fill = FALSE)
+
+# #visualise patterns in nmr coding
+# nmr_coding %>%
+#   dplyr::select(-(2:3))%>%
+#   gather(key,value,-feature_code) %>%
+#   ggplot(aes(x=factor(key,levels = names(nmr_coding[4:ncol(nmr_coding)])),
+#              y=factor(feature_code,levels = feature_code[1:226]),
+#              fill=value))+
+#   geom_tile() +
+#   coord_flip()+
+#   # theme(axis.text.y=element_text(size=4))+
+#   theme(axis.text.x=element_text(size=4, angle = 90))+
+#   ylab("nmr variable")+
+#   xlab("tag")
+# ggsave(filename =  glue("nmr_coding.png"), width = 10, height = 30)
+  
+```
+
+For WGCNA, encouraging results:
+
+* small clusters show very clear enrichment
+* grey clusters = AA, proteins, small molecules; this makes sense given the platform used.
+* apoA co-enriched with HDL, apoB in cluster with VLDL
+
+For spectral clustering:
+
+* high heterogeneity within clusters, enrichment tags not very meaningful.
+* Perhaps try larger k in clustering algo?
+
+```{r cluster-enrich}
+wgnca_nmr_cluster_anno <- nmr_clust_enrich(nmr_coding, lipid_nmr_cluster_indices_wgcna)
+wgnca_nmr_cluster_hybrid_anno <- nmr_clust_enrich(nmr_coding, lipid_nmr_cluster_indices_wgcna_hybrid)
+# spectral_nmr_cluster_anno <- nmr_clust_enrich(nmr_coding, lipid_ms_cluster_indices_spectral$label)
+
+# undebug(nmr_clust_enrich)
+# View(nmr_cluster_anno)
+
+wgnca_nmr_cluster_anno %>%
+  dplyr::select(-p_adj)%>%
+  write_tsv(glue("{resultdir}/wgcna_nmr_cluster_anno.tsv"))
+wgnca_nmr_cluster_hybrid_anno %>%
+  dplyr::select(-p_adj)%>%
+  write_tsv(glue("{resultdir}/wgnca_nmr_cluster_hybrid_anno.tsv"))
+
+# spectral_nmr_cluster_anno %>%
+#   dplyr::select(cluster, tags, members)%>%
+#   write_csv(glue("{resultdir}/spectral_nmr_cluster_anno.csv"))
+
+```
+
+Now manually interpret the clusters and save to .ods using libreoffice calc.
+
+```{r read-manual-enrich-anno}
+wgnca_nmr_cluster_hybrid_anno_man <- read_ods("/home/simon/Dropbox/Simon Mini Project/results/multi-omics-project/wgnca_nmr_cluster_anno_hybrid_manual.ods")
+```
+
+
+## MS clusters
+
+
+```{r LION-inputs-lipidmaps}
+
+#for each cluster, write lipidmaps ids to tsv
+data_frame(lipid_ms_id = names(lipid_ms),
+           cluster=lipid_ms_cluster_indices_wgcna) %>%
+  left_join(lipidmaps_anno_df) %>%
+  split(x=.,f=.$cluster) %>%
+  walk(~.x %>%  
+         dplyr::select(LM_ID) %>%
+         write_tsv(file.path(datadir, 
+                             "lipid_ms_cluster_lipidmaps_ids", 
+                             paste0(unique(.x$cluster),".tsv")),
+                   col_names = FALSE))
+
+# background: all Lipidmaps IDs in study
+write_tsv(lipidmaps_anno_df %>% dplyr::select(LM_ID),
+          file.path(datadir, 
+                    "lipid_ms_cluster_lipidmaps_ids/all_clusters.tsv"),
+          col_names = FALSE)
+
+
+
+```
+
+```{r LION-inputs-abbrev}
+
+# reformat to LION input format PC(36:0); SM(d18:1/20:1)]
+lion_input_format <- data_frame(lipid_ms_id = names(lipid_ms),
+           cluster=lipid_ms_cluster_indices_wgcna) %>%
+  mutate(lipid_ms_id = gsub(lipid_ms_id, pattern = "_O", replacement = "_")) %>%
+  mutate(lipid_ms_id = gsub(lipid_ms_id, pattern = "^l", replacement = "")) %>%
+  mutate(lipid_ms_id = gsub(lipid_ms_id, pattern = "^TAG", replacement = "TG")) %>%
+  separate(lipid_ms_id, into = paste0("v",1:5), sep = "_", remove=FALSE) %>%
+  mutate(lion_format = ifelse(is.na(.$v5),
+                              glue("{v1}({v2}:{v3})"),
+                              glue("{v1}({v2}:{v3}/{v4}:{v5})"))) %>%
+  dplyr::select(-(v1:v5))
+
+# for each cluster, write lipid_ms_id in LION input format to tsv
+lion_input_format %>%
+  split(x=.,f=.$cluster) %>%
+  walk(~.x %>%  
+         dplyr::select(lion_format) %>%
+         write_tsv(file.path(datadir, 
+                             "lipid_ms_cluster_lion_format_ids", 
+                             paste0(unique(.x$cluster),".tsv")),
+                   col_names = FALSE))
+
+# background: all lipid_ms_ids in study
+write_tsv(lion_input_format %>% dplyr::select(lion_format),
+          file.path(datadir, 
+                    "lipid_ms_cluster_lion_format_ids/all_clusters.tsv"),
+          col_names = FALSE)
+
+```
+
+Only ~50% of LipidMaps IDs and 77% of abbreviation-formatted IDs [C(36:0); SM(d18:1/20:1)] could be matched to LION. Given strong clustering per prefix (top-level) lipid type, perform similar enrichment as for nmr.
+
+```{r ms-coding}
+ms_coding <-tibble(lipid_ms_id = names(lipid_ms),
+           cluster=lipid_ms_cluster_indices_wgcna) %>%
+  separate(lipid_ms_id, into = c("type",paste0("v",1:4)), sep = "_", remove=FALSE) %>%
+  dummy_cols("type") %>%
+  setNames(names(.) %>% gsub(., pattern = "type_", replacement = ""))
+
+
+```
+
+Spectral clustering on MS gives 3 highly homogeneous clusters of small size (n=3, 6, 16) and one large heterogeneous cluster (n=113).
+
+```{r cluster-enrich}
+wgnca_ms_cluster_anno <- ms_clust_enrich(ms_coding, lipid_ms_cluster_indices_wgcna) 
+spectral_ms_cluster_anno <- ms_clust_enrich(ms_coding, lipid_ms_cluster_indices_spectral$label) 
+
+wgnca_ms_cluster_anno %>%
+  dplyr::select(cluster, tags, members)%>%
+  write_csv(glue("{resultdir}/wgnca_ms_cluster_anno.csv"))
+spectral_ms_cluster_anno %>%
+  dplyr::select(cluster, tags, members)%>%
+  write_csv(glue("{resultdir}/spectral_ms_cluster_anno.csv"))
+
+```
+
+
+# Construct merged clusters
+
+```{r}
+# construct merged cluster MEs and merged cluster indices
+# all elements of "apo proteins" and "clinical" are treated as singleton clusters
+me_merged <- cbind(
+  lipid_ms_me_wgcna$eigengenes,
+    # setNames(recode_color_label(names(.),"lms")),    #avoid duplicate names (colors) btw modalities
+  clinical,
+  lipid_nmr_me_wgcna$eigengenes,
+    # setNames(recode_color_label(names(.),"lnmr")),   #avoid duplicate names (colors) btw modalities
+  protein_ms)
+
+
+# cluster indices
+merged_cluster_indices <- c(
+  lipid_ms_cluster_indices_wgcna,
+  names(clinical),
+  lipid_nmr_cluster_indices_wgcna,
+  names(protein_ms))
+
+
+# cluster annotation
+# debug(map_cluster_colcode_to_anno)
+merged_cluster_anno <-  c(
+  names(lipid_ms_me_wgcna$eigengenes) %>% 
+    # recode_color_label(.,"lms") %>%
+  map_cluster_colcode_to_anno(., wgnca_ms_cluster_anno),
+  names(clinical),
+  names(lipid_nmr_me_wgcna$eigengenes) %>% 
+    # recode_color_label(.,"lnmr") %>%
+    map_cluster_colcode_to_anno(., wgnca_nmr_cluster_anno),
+  names(protein_ms))
+
+# cluster modalities
+merged_modalities <- labels2colors(c(
+  rep("lms", ncol(lipid_ms_me_wgcna$eigengenes)),
+  rep("clin", ncol(clinical)),
+  rep("lnmr", ncol(lipid_nmr_me_wgcna$eigengenes)),
+  rep("pms", ncol(protein_ms))),
+  colorSeq = ggplot_qual_colors(4))
+
+
+```
+
+
+
+# Calculate module-pheno assoc
+
+```{r}
+lnmr_pheno <- get_me_pheno_associations(lipid_nmr_me_wgcna$eigengenes, y)
+
+merged_pheno <- get_me_pheno_associations(me_merged, y)
+```
+
+
+# Calculate module-module assoc
+
+
+```{r}
+
+# pairwise ME-ME correlations
+lnmr_lms_pw_me <- pairwise_ME_cor(
+  row_mod = lipid_nmr_me_wgcna$eigengenes, 
+  col_mod = lipid_ms_me_wgcna$eigengenes, 
+  pw_corfnc="spearman")
+
+merged_merged_pw_me <- pairwise_ME_cor(
+  row_mod = me_merged,
+  col_mod = me_merged,
+  pw_corfnc = "spearman"
+)
+
+# in-vs-out-of-module difference in ME correlation
+lnmr_lms_me_indiv <- get_modme_modindiv_cluster_associations(
+  eigengenes = lipid_nmr_me_wgcna$eigengenes, 
+  modindiv = lipid_ms,
+  modindiv_clusters = lipid_ms_cluster_indices_wgcna
+  )
+
+# debug(get_modme_modindiv_cluster_associations)
+merged_merged_me_indiv <- get_modme_modindiv_cluster_associations(
+  eigengenes = me_merged, 
+  modindiv = bruneck,
+  modindiv_clusters = merged_cluster_indices
+  )
+```
+
+# Create plots
+
+
+```{r simple-heatmap}
+heatmap(test$pw_cor, revC = TRUE, scale = "none")
+
+png(width=15,height = 15, units = "in", res=600)
+corrplot(test$pw_cor, order = "hclust", hclust.method = "average", method = "color", tl.cex = 0.5, col = rev(col2(500)), type = "upper")
+dev.off()
+```
+
+
+
+```{r pedersen-heatmaps}
+
+# lipid nmr vs lipid ms --------------------------------------------------------
+make_pedersen_heatmap(
+  filename = glue("{figdir}/lnmr_lms_pw_me.pdf"),
+  mod_mod_cor_l = lnmr_lms_pw_me,
+  pheno_rowmod_cor_l = lnmr_pheno,
+  dev="pdf",
+  dev_height=10,
+  dev_width=10,  
+  dendro_show = "both",
+  # symm = TRUE,
+  keyvalname = "ME spearman corr",
+  revC = TRUE,
+  labRow = map_cluster_colcode_to_anno(rownames(lnmr_lms_pw_me$est_m), wgnca_nmr_cluster_anno),
+  labCol = map_cluster_colcode_to_anno(colnames(lnmr_lms_pw_me$est_m), wgnca_ms_cluster_anno)
+)
+
+# debug(make_pedersen_heatmap)
+make_pedersen_heatmap(
+  filename = glue("{figdir}/lnmr_lms_me_indiv.pdf"),
+  mod_mod_cor_l = lnmr_lms_me_indiv,
+  pheno_rowmod_cor_l = lnmr_pheno,
+  dev_height=10,
+  dev_width=10,
+  dendro_show = "both",
+  # symm = TRUE,
+  keyvalname = "ME corr shift in-vs-out",
+  revC = TRUE,
+  labRow = map_cluster_colcode_to_anno(rownames(lnmr_lms_me_indiv$est_m), wgnca_nmr_cluster_anno),
+  labCol = map_cluster_colcode_to_anno(colnames(lnmr_lms_me_indiv$est_m), wgnca_ms_cluster_anno)
+)
+
+# merged vs merged -------------------------------------------------------------
+
+make_pedersen_heatmap(
+  filename = glue("{figdir}/merged_merged_pw_me.pdf"),
+  dev = "pdf",
+  mod_mod_cor_l = merged_merged_pw_me,
+  pheno_rowmod_cor_l = merged_pheno,
+  dev_height=10,
+  dev_width=15,
+  dendro_show = "column",
+  # symm = TRUE,
+  keyvalname = "ME spearman corr",
+  revC = TRUE,
+  labRow = merged_cluster_anno,
+  labCol = merged_cluster_anno,
+  row_modality_color = merged_modalities,
+  # modality_bar = merged_modalities
+  col_label_color = merged_modalities
+  # colsidecolors = matrix(merged_modalities, ncol = 1),
+  # margins = c(100, 100)
+)
+
+make_pedersen_heatmap(
+  filename = glue("{figdir}/merged_merged_me_indiv.pdf"),
+  mod_mod_cor_l = merged_merged_me_indiv,
+  pheno_rowmod_cor_l = merged_pheno,
+  dev_height=10,
+  dev_width=15,
+  dendro_show = "both",
+  keyvalname = "ME corr shift in-vs-out",
+  revC = TRUE,
+  labRow = merged_cluster_anno,
+  labCol = merged_cluster_anno
+  # symm = TRUE
+)
+
+
+```
+
+
+# Sub-analyses
+
+## NMR - apo
+
+### Signed network
+
+```{r NMR-apo(a)-co-clustering}
+
+# modules
+nmr_me_apo_merged <- cbind(lipid_nmr_me_wgcna$eigengenes,
+                           protein_ms)
+
+lipid_nmr_me_wgcna$varExplained
+
+# cluster annotation
+# debug(map_cluster_colcode_to_anno)
+nmr_me_apo_merged_cluster_anno <-  c(
+  names(lipid_nmr_me_wgcna$eigengenes) %>% 
+    # recode_color_label(.,"lnmr") %>%
+    map_cluster_colcode_to_anno(., wgnca_nmr_cluster_anno),
+  names(protein_ms))
+
+# cluster modalities
+nmr_me_apo_merged_modalities <- labels2colors(c(
+  rep("lnmr", ncol(lipid_nmr_me_wgcna$eigengenes)),
+  rep("pms", ncol(protein_ms))),
+  colorSeq = ggplot_qual_colors(4))
+
+# body: pw-correlations
+nmr_me_apo_merged_pw_me <- pairwise_ME_cor(
+  row_mod = nmr_me_apo_merged,
+  col_mod = nmr_me_apo_merged,
+  pw_corfnc = "spearman"
+)
+
+# pheno
+nmr_me_apo_merged_pheno <- get_me_pheno_associations(nmr_me_apo_merged, y)
+
+# plot
+make_pedersen_heatmap(
+  filename = glue("{figdir}/nmr_me_apo_merged.pdf"),
+  dev = "pdf",
+  mod_mod_cor_l = nmr_me_apo_merged_pw_me,
+  pheno_rowmod_cor_l = nmr_me_apo_merged_pheno,
+  dev_height=10,
+  dev_width=15,
+  dendro_show = "column",
+  # symm = TRUE,
+  keyvalname = "ME spearman corr",
+  revC = TRUE,
+  labRow = nmr_me_apo_merged_cluster_anno,
+  labCol = nmr_me_apo_merged_cluster_anno,
+  row_modality_color = nmr_me_apo_merged_modalities,
+  # modality_bar = merged_modalities
+  col_label_color = "supercluster",
+  deepSplit = 4,
+  minClusterSize = 3
+  # colsidecolors = matrix(merged_modalities, ncol = 1),
+  # margins = c(100, 100)
+)
+
+
+```
+
+### Signed hybrid network
+
+```{r NMR-apo(a)-co-clustering-hybrid}
+
+# modules
+nmr_me_apo_merged_hybrid <- cbind(lipid_nmr_me_wgcna_hybrid$eigengenes,
+                           protein_ms)
+
+# cluster annotation
+annotation_reordered <- reorder_annotation_by_colcodes(
+  colcodes = names(lipid_nmr_me_wgcna_hybrid$eigengenes),
+  cluster_anno = wgnca_nmr_cluster_hybrid_anno_man)
+
+nmr_me_apo_merged_cluster_anno_hybrid <-  c(annotation_reordered$manual, names(protein_ms))
+
+# cluster modalities
+nmr_me_apo_merged_modalities_hybrid <-c(
+  rep("NMR", ncol(lipid_nmr_me_wgcna_hybrid$eigengenes)),
+  rep("apo_MRM", ncol(protein_ms)))
+
+# body: pw-correlations
+nmr_me_apo_merged_pw_me_hybrid <- pairwise_ME_cor(
+  row_mod = nmr_me_apo_merged_hybrid,
+  col_mod = nmr_me_apo_merged_hybrid,
+  pw_corfnc = "spearman"
+)
+
+# pheno
+nmr_me_apo_merged_pheno_hybrid <- get_me_pheno_associations(nmr_me_apo_merged_hybrid, y) %>%
+  .[1:3] %>%
+  map(~.x %>% 
+        as_tibble() %>% 
+        dplyr::select(CVD =  matches("lrm_cvd_[^(sa)]"),
+                `CVD, age+sex adj` = matches("lrm_cvd_sa_"),
+                `CVD, age+sex+statin adj` = matches("lrm_cvd_sas_")) %>%
+        as.matrix(.))
+
+  
+
+# plot
+
+anno_df <- data.frame(
+  var_pc1 = c(structure(unlist(lipid_nmr_me_wgcna_hybrid$varExplained[1,]),
+                         names=names(lipid_nmr_me_wgcna_hybrid$eigengenes)),
+                rep(1,ncol(protein_ms))),
+  modality = nmr_me_apo_merged_modalities_hybrid,
+  # size = c(annotation_reordered$n, rep(1,ncol(protein_ms))),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::rename("cluster var expl." = "var_pc1")
+
+
+
+
+# plot with ComplexHeatmap
+# undebug(make_complex_heatmap)
+out <- make_complex_heatmap(
+  mat = nmr_me_apo_merged_pw_me_hybrid$est_m,
+  pheno_l =  nmr_me_apo_merged_pheno_hybrid,
+  hc_method = "average",
+  row_labels = nmr_me_apo_merged_cluster_anno_hybrid,
+  col_labels = nmr_me_apo_merged_cluster_anno_hybrid,
+  annotation_df = anno_df,
+  clustersizes =  c(annotation_reordered$n, rep(1,ncol(protein_ms))),
+  # annotationdf_colors = anno_colors,  # now implemented as default method
+  core_heatmap_legend_title = "inter-cluster correlation\n(spearman)",
+  # km=5,
+  deepSplit=4,
+  minClusterSize = 3,
+  y = y,
+  me = nmr_me_apo_merged_hybrid
+)
+
+out$hm
+out$row_order
+
+
+```
+
+### incl clinical
+
+```{r NMR-apo(a)-clin-co-clustering-hybrid}
+
+# modules
+nmr_me_apoclin_merged_hybrid <- cbind(lipid_nmr_me_wgcna_hybrid$eigengenes,
+                                      protein_ms,
+                                      clinical)
+
+# cluster annotation
+annotation_reordered <- reorder_annotation_by_colcodes(
+  colcodes = names(lipid_nmr_me_wgcna_hybrid$eigengenes),
+  cluster_anno = wgnca_nmr_cluster_hybrid_anno_man)
+
+nmr_me_apoclin_merged_cluster_anno_hybrid <-  c(annotation_reordered$manual, names(protein_ms), names(clinical))
+
+# cluster modalities
+nmr_me_apoclin_merged_modalities_hybrid <-c(
+  rep("NMR", ncol(lipid_nmr_me_wgcna_hybrid$eigengenes)),
+  rep("apo MRM", ncol(protein_ms)),
+  rep("clinical", ncol(clinical)))
+
+# body: pw-correlations
+nmr_me_apoclin_merged_pw_me_hybrid <- pairwise_ME_cor(
+  row_mod = nmr_me_apoclin_merged_hybrid,
+  col_mod = nmr_me_apoclin_merged_hybrid,
+  pw_corfnc = "spearman"
+)
+
+# pheno
+nmr_me_apoclin_merged_pheno_hybrid <- get_me_pheno_associations(nmr_me_apoclin_merged_hybrid, y) %>%
+  .[1:3] %>%
+  map(~.x %>% 
+        as_tibble() %>% 
+        dplyr::select(CVD =  matches("lrm_cvd_[^(sa)]"),
+                `CVD, age+sex adj` = matches("lrm_cvd_sa_"),
+                `CVD, age+sex+statin adj` = matches("lrm_cvd_sas_")) %>%
+        as.matrix(.))
+
+
+# annotations
+anno_df <- data.frame(
+  var_pc1 = c(structure(unlist(lipid_nmr_me_wgcna_hybrid$varExplained[1,]),
+                         names=names(lipid_nmr_me_wgcna_hybrid$eigengenes)),
+              rep(1,ncol(protein_ms)),
+              rep(1, ncol(clinical))),
+  modality = nmr_me_apoclin_merged_modalities_hybrid,
+  # size = c(annotation_reordered$n, rep(1,ncol(protein_ms))),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::rename("cluster PC1 var expl." = "var_pc1")
+
+
+
+
+# plot with ComplexHeatmap
+debug(make_complex_heatmap)
+out <- make_complex_heatmap(
+  mat = nmr_me_apoclin_merged_pw_me_hybrid$est_m,
+  pheno_l =  nmr_me_apoclin_merged_pheno_hybrid,
+  hc_method = "average",
+  row_labels = nmr_me_apoclin_merged_cluster_anno_hybrid,
+  col_labels = nmr_me_apoclin_merged_cluster_anno_hybrid,
+  annotation_df = anno_df,
+  clustersizes =  c(annotation_reordered$n, rep(1,ncol(protein_ms)+ncol(clinical))),
+  # annotationdf_colors = anno_colors,  # now implemented as default method
+  core_heatmap_legend_title = "inter-cluster correlation\n(spearman)",
+  # km=5,
+  deepSplit=4,
+  minClusterSize = 3,
+  y = y,
+  me = nmr_me_apoclin_merged_hybrid
+)
+
+# save plot
+png(glue("{figdir}/heatmap_nmr_me_apoclin_hybrid.png"), width = 15, height = 10, units="in", res=600)
+out$hm
+decorate_heatmap_body("CVD association", {
+  grid.text("cluster", y = unit(1, "npc") + unit(10, "mm"),rot=65)
+})
+decorate_heatmap_body("CVD association_superclust", {
+  grid.text("supercluster", y = unit(1, "npc") + unit(15, "mm"), rot=65)
+})
+dev.off()
+
+
+
+
+tmp <-   cbind(
+    nmr_me_apoclin_merged_hybrid[,c("lnmr_ME771155", "lnmr_ME7B8B35", "lnmr_ME6BBD94")], 
+    clinical$Triglycerides,
+    dplyr::select(protein_ms, APOB, APOE, APOC2, APOC3)
+  )
+apoB_superclust  <- moduleEigengenes(
+  tmp,
+  colors = rep(1,ncol(tmp)), 
+  nPC=10, impute = FALSE,
+  excludeGrey = TRUE, subHubs = FALSE, 
+  scale = FALSE)
+
+frac_superclust<- moduleEigengenes(
+  nmr_me_apoclin_merged_hybrid[,c("lnmr_ME46ABAB", "lnmr_MED1CB6B", "lnmr_ME1D7D83", "lnmr_MEC18E5B")], 
+  colors = rep(1,4), 
+  nPC=10, impute = FALSE,
+  excludeGrey = TRUE, subHubs = FALSE, 
+  scale = FALSE)
+
+head(apoB_superclust$eigengenes)
+head(frac_superclust$eigengenes)
+head(HR_df)
+
+# export for CPH analysis
+HR_df <- tibble(apoa = protein_ms$APOA,
+       fract_VLDL_LDL_chol_supercluster_red = frac_superclust$eigengenes$ME1,
+       large_VLDL_cluster = nmr_me_apoclin_merged_hybrid$lnmr_ME771155,
+       VLDL_apoB_TG_supercluster_darkgreen = apoB_superclust$eigengenes$ME1) %>%
+  bind_cols(y, .)
+
+
+HR_df %>%
+  dplyr::select(CVD0010, apoa:VLDL_apoB_TG_supercluster_darkgreen) %>%
+  group_by(CVD0010) %>%
+  summarise_all(funs(mean))
+
+write_tsv(HR_df, glue("{datadir}/HR_df.tsv"))
+
+
+```
+
+
+```{r}
+# connectivity for superclustering
+
+## ! only makes sense if the superclustering itself is based on connectivity
+#     but then plot could not show correlation heatmap between clusters, only between PC1s of superclusters (because HC of adj/TOM used as input to treecut to defined superclusters, not the correlation values)
+#     potential solution: hybrid graph with WGCNA for supercluster definition and supercluster PC1 HC, with lower levels of hierarchy defined at cluster level, based on between-cluster correlations
+
+# mat <- nmr_me_apo_merged_pw_me_hybrid$est_m
+# hdist <- dist(mat)
+# 
+# # power parameter
+# powers = c(c(1:10), seq(from = 12, to=20, by=2))
+# common_pars <- list(data=mat, verbose= 0,  moreNetworkConcepts = TRUE, powerVector = powers)
+# pars <- expand.grid(networktype = 'signed hybrid',
+#             corFnc = c('cor', 'bicor'),
+#             stringsAsFactors = FALSE)
+# 
+# nmr_me_apo_power <- optimize_network_pars(common_pars, pars, powers, plt_title = "NMR_me+apo")
+# # suggests exactly same power & network pars as selected in NMR WGCNA
+# 
+# supercluster_pars <- expand.grid(
+#   deep = 1:4,
+#   minModuleSize = 3:5,
+#   cluster_method = c("complete", "single", "average", "wgnca_cor_hybrid_9", "wgnca_bicor_hybrid_10")
+# )
+# 
+# supercluster_quality <- list()
+# for (i in seq_along(nrow(supercluster_pars))){
+#   
+#   # extract parameter set i
+#   deep <- supercluster_pars$deep[i]
+#   minModuleSize <- supercluster_pars$minModuleSize[i]
+#   hc_method <- supercluster_pars$hc_method[i]
+#   if (str_detect(cluster_method, "wgnca")){
+#     
+#   }
+#   
+#   # define clusters using parameters
+#   hc <- hclust(hdist, method = hc_method)
+#   dynamic_mods <- dynamicTreeCut::cutreeHybrid(dendro =hc, 
+#                                                  distM = as.matrix(hdist),
+#                                                  deepSplit = deep, pamRespectsDendro = TRUE,
+#                                                  minClusterSize = minModuleSize)
+#   
+#   # calculate pc1 representativeness per cluster
+#   pc1_rep <- moduleEigengenes(
+#     mat, 
+#     colors =  dynamic_mods$labels, 
+#     nPC=10, impute = FALSE,
+#     excludeGrey = FALSE, subHubs = FALSE, 
+#     scale = FALSE) %>% 
+#     .[['varExplained']] %>% 
+#     .[1,] %>% 
+#     t(.) %>% 
+#     as.data.frame() %>%
+#     rownames_to_column() %>%
+#     mutate(supercluster = str_replace(rowname, "X", "")) %>%
+#     dplyr::select(`supercluster var expl.` = `1`,
+#                   supercluster)
+#   
+#   # calculate k per clusters
+#   adj <- adjacency(mat, type="dist")
+#   
+#   supercluster_quality[[i]] <- tibble(
+#     pc1_rep = pc1_rep
+#   )
+# }
+
+
+
+
+intramodularConnectivity(
+    adjMat = TOM,
+    colors = dendrocolors$module,
+    # getWholeNetworkConnectivity	=TRUE  #not supported
+  )
+```
+
+
+# Additional analyses
+
+## PCSK9 - Saphir
+
+```{r}
+
+saphir_log_pheno <-get_saphir_pheno_associations(dplyr::select(saphir,-PCSK9),
+                                                 dplyr::select(saphir_y,-id)) %>%
+  .[1:3] %>%
+  map(~.x %>% 
+        as_tibble() %>% 
+        dplyr::select(CVD =  matches("lrm_cvd_[^(sa)]"),
+                `CVD, age+sex adj` = matches("lrm_cvd_sa_")) %>%
+        as.matrix(.))
+
+saphir_nolog_pheno <-get_saphir_pheno_associations(dplyr::select(saphir,-logPCSK9),
+                                                 dplyr::select(saphir_y,-id)) %>%
+  .[1:3] %>%
+  map(~.x %>% 
+        as_tibble() %>% 
+        dplyr::select(CVD =  matches("lrm_cvd_[^(sa)]"),
+                `CVD, age+sex adj` = matches("lrm_cvd_sa_")) %>%
+        as.matrix(.))
+
+
+saphir_modalities <-c(
+  rep("MRM", ncol(saphir)-3),
+  "ELISA"
+)
+
+
+# body: pw-correlations
+saphir_log_pw_cor_spearman <- pairwise_ME_cor(
+  row_mod =  dplyr::select(saphir,-one_of("id", "PCSK9")),
+  col_mod =  dplyr::select(saphir,-one_of("id", "PCSK9")),
+  pw_corfnc = "spearman"
+)
+
+saphir_log_pw_cor_pearson <- pairwise_ME_cor(
+  row_mod =  dplyr::select(saphir,-one_of("id", "PCSK9")),
+  col_mod =  dplyr::select(saphir,-one_of("id", "PCSK9")),
+  pw_corfnc = "pearson"
+)
+# body: pw-correlations
+saphir_nolog_pw_cor_spearman <- pairwise_ME_cor(
+  row_mod =  dplyr::select(saphir,-one_of("id", "logPCSK9")),
+  col_mod =  dplyr::select(saphir,-one_of("id", "logPCSK9")),
+  pw_corfnc = "spearman"
+)
+
+saphir_nolog_pw_cor_pearson <- pairwise_ME_cor(
+  row_mod =  dplyr::select(saphir,-one_of("id", "logPCSK9")),
+  col_mod =  dplyr::select(saphir,-one_of("id", "logPCSK9")),
+  pw_corfnc = "pearson"
+)
+
+# sanity check: comparison log vs nolog
+saphir_log_pw_cor_spearman$est_m == saphir_nolog_pw_cor_spearman$est_m # log is monotonous
+saphir_log_pw_cor_pearson$est_m == saphir_nolog_pw_cor_pearson$est_m
+saphir_log_pw_cor_pearson$est_m - saphir_nolog_pw_cor_pearson$est_m
+
+
+# annotations
+saphir_anno_df <- data.frame(
+  modality = saphir_modalities,
+  # size = c(annotation_reordered$n, rep(1,ncol(protein_ms))),
+  stringsAsFactors = FALSE
+)
+
+
+# maintain same core_col for comparison between plots with same color scale
+core_col <- define_colors(as.vector(saphir_log_pw_cor_spearman$est_m), 
+                          breaks = c(-1,0,1), quant_colors = c("blue", "white", "red"))
+## log PCSK9 -----------------------------------
+
+# spearman cor
+out_spearman <- make_complex_heatmap(
+  mat = saphir_log_pw_cor_spearman$est_m,
+  pheno_l =  saphir_log_pheno,
+  hc_method = "average",
+  row_labels = names(dplyr::select(saphir,-one_of("id", "PCSK9"))),
+  col_labels = names(dplyr::select(saphir,-one_of("id", "PCSK9"))),
+  annotation_df = saphir_anno_df,
+  core_heatmap_legend_title = "inter-feature correlation\n(spearman)",
+  supercluster_pheno_f = get_saphir_pheno_associations,
+  deepSplit=4,
+  minClusterSize = 2,
+  y = dplyr::select(saphir_y, -id),
+  me = dplyr::select(saphir,-one_of("id", "PCSK9")),
+  show_annotation_legends = "all",
+  core_col = core_col
+)
+
+png(glue("{figdir}/heatmap_saphir_logPCSK9_spearman.png"), width = 10, height = 7, units="in", res=600)
+out_spearman$hm
+decorate_heatmap_body("CVD association", {
+  grid.text("cluster", y = unit(1, "npc") + unit(10, "mm"),rot=65)
+})
+decorate_heatmap_body("CVD association_superclust", {
+  grid.text("supercl.", y = unit(1, "npc") + unit(10, "mm"), rot=65)
+})
+dev.off()
+
+# pearson cor
+out_pearson<- make_complex_heatmap(
+  mat = saphir_log_pw_cor_pearson$est_m,
+  pheno_l =  saphir_log_pheno,
+  hc_method = "average",
+  row_labels = names(dplyr::select(saphir,-one_of("id", "PCSK9"))),
+  col_labels = names(dplyr::select(saphir,-one_of("id", "PCSK9"))),
+  annotation_df = saphir_anno_df,
+  core_heatmap_legend_title = "inter-feature correlation\n(pearson)",
+  supercluster_pheno_f = get_saphir_pheno_associations,
+  deepSplit=4,
+  minClusterSize = 2,
+  y = dplyr::select(saphir_y, -id),
+  me = dplyr::select(saphir,-one_of("id", "PCSK9")),
+  show_annotation_legends = "all",
+  core_col = core_col
+)
+png(glue("{figdir}/heatmap_saphir_logPCSK9_pearson.png"), width = 10, height = 7, units="in", res=600)
+out_pearson$hm
+decorate_heatmap_body("CVD association", {
+  grid.text("cluster", y = unit(1, "npc") + unit(10, "mm"),rot=65)
+})
+decorate_heatmap_body("CVD association_superclust", {
+  grid.text("supercl.", y = unit(1, "npc") + unit(10, "mm"), rot=65)
+})
+dev.off()
+
+# same results -> presumably due to pre-processing
+
+
+
+## absolute PCSK9  -----------------------------------
+# spearman cor
+out_spearman <- make_complex_heatmap(
+  mat = saphir_nolog_pw_cor_spearman$est_m,
+  pheno_l =  saphir_nolog_pheno,
+  hc_method = "average",
+  row_labels = names(dplyr::select(saphir,-one_of("id", "logPCSK9"))),
+  col_labels = names(dplyr::select(saphir,-one_of("id", "logPCSK9"))),
+  annotation_df = saphir_anno_df,
+  core_heatmap_legend_title = "inter-feature correlation\n(spearman)",
+  supercluster_pheno_f = get_saphir_pheno_associations,
+  deepSplit=4,
+  minClusterSize = 2,
+  y = dplyr::select(saphir_y, -id),
+  me = dplyr::select(saphir,-one_of("id", "logPCSK9")),
+  show_annotation_legends = "all",
+  core_col = core_col
+)
+png(glue("{figdir}/heatmap_saphir_spearman.png"), width = 10, height = 7, units="in", res=600)
+out_spearman$hm
+decorate_heatmap_body("CVD association", {
+  grid.text("cluster", y = unit(1, "npc") + unit(10, "mm"),rot=65)
+})
+decorate_heatmap_body("CVD association_superclust", {
+  grid.text("supercl.", y = unit(1, "npc") + unit(10, "mm"), rot=65)
+})
+dev.off()
+
+# pearson cor
+out_pearson<- make_complex_heatmap(
+  mat = saphir_nolog_pw_cor_pearson$est_m,
+  pheno_l =  saphir_nolog_pheno,
+  hc_method = "average",
+  row_labels = names(dplyr::select(saphir,-one_of("id", "logPCSK9"))),
+  col_labels = names(dplyr::select(saphir,-one_of("id", "logPCSK9"))),
+  annotation_df = saphir_anno_df,
+  core_heatmap_legend_title = "inter-feature correlation\n(pearson)",
+  supercluster_pheno_f = get_saphir_pheno_associations,
+  deepSplit=4,
+  minClusterSize = 2,
+  y = dplyr::select(saphir_y, -id),
+  me = dplyr::select(saphir,-one_of("id", "logPCSK9")),
+  show_annotation_legends = "all",
+  core_col = core_col
+)
+png(glue("{figdir}/heatmap_saphir_pearson.png"), width = 10, height = 7, units="in", res=600)
+out_pearson$hm
+decorate_heatmap_body("CVD association", {
+  grid.text("cluster", y = unit(1, "npc") + unit(10, "mm"),rot=65)
+})
+decorate_heatmap_body("CVD association_superclust", {
+  grid.text("supercl.", y = unit(1, "npc") + unit(10, "mm"), rot=65)
+})
+dev.off()
+
+
+```
+
+
+# Driver-modality analysis
+
+## HDL supercluster
+
+Different estimates for feature LOO versus cluster LOO are seen for singleton clusters, e.g. HDL_C, APOA1_HUMAN. This is because the reference is different: the full-information PC1 used as reference is constructed from individual features the feature LOO; for the cluster LOO the full-information PC1 is constructed from cluster PC1s.
+
+```{r HDL-supercluster}
+# visual interpretation of merged_merged_pw_me.pdf
+HDL_sc_member_clusters <- c("lnmr_114477", "HDL_C", "lnmr_44AAAA", "APOA1_HUMAN" , "lnmr_77AADD")
+
+# individual feature members
+HDL_sc <- get_sc_composition(HDL_sc_member_clusters)
+
+# supercluster PC1
+HDL_sc_me_l <- bruneck %>%
+  dplyr::select(HDL_sc$feature) %>%
+  moduleEigengenes(., nPC=10, impute = FALSE, colors = rep(1, nrow(HDL_sc)),
+                   excludeGrey = FALSE, subHubs = FALSE, 
+                   scale = FALSE)
+
+HDL_sc_me_l$varExplained
+HDL_sc_me <- HDL_sc_me_l$eigengenes
+
+# LOO
+HDL_sc_loo <- LOO_analysis(sc_composition=HDL_sc, bruneck, me_merged, y)
+
+
+
+```
+
+```{r plot-HDL-sc-loo}
+HDL_sc_loo$p_feature_loo
+HDL_sc_loo$p_cluster_loo
+HDL_sc_loo$p_feature_loo_per_cluster
+```
+
+
+## VLDL-frac supercluster
+
+```{r VLDL-frac-supercluster}
+# visual interpretation of merged_merged_pw_me.pdf
+VLDL_frac_sc_member_clusters <- c("lnmr_AAAA44", "lnmr_771122", "lnmr_DDDD77")
+
+# individual feature members
+VLDL_frac_sc <- get_sc_composition(VLDL_frac_sc_member_clusters)
+
+# supercluster PC1
+VLDL_frac_sc_me_l <- bruneck %>%
+  dplyr::select(VLDL_frac_sc$feature) %>%
+  moduleEigengenes(., nPC=10, impute = FALSE, colors = rep(1, nrow(VLDL_frac_sc)),
+                   excludeGrey = FALSE, subHubs = FALSE, 
+                   scale = FALSE)
+
+VLDL_frac_sc_me_l$varExplained
+VLDL_frac_sc_me <- VLDL_frac_sc_me_l$eigengenes
+
+# LOO analysis
+VLDL_frac_loo <- LOO_analysis(sc_composition=VLDL_frac_sc, bruneck, me_merged, y)
+```
+
+```{r plot-VLDL-frac-sc-loo}
+VLDL_frac_loo$p_feature_loo
+VLDL_frac_loo$p_cluster_loo
+VLDL_frac_loo$p_feature_loo_per_cluster
+
+```
+
+## TAG supercluster
+
+```{r VLDL-frac-supercluster}
+# visual interpretation of merged_merged_pw_me.pdf
+TAG_sc_member_clusters <- c("lnmr_CC99BB", "lms_5285B8", "lms_A2A23C", "Triglycerides", "lms_80A768", "lnmr_771155")
+
+# individual feature members
+TAG_sc <- get_sc_composition(TAG_sc_member_clusters)
+
+# supercluster PC1
+TAG_sc_me_l <- bruneck %>%
+  dplyr::select(TAG_sc$feature) %>%
+  moduleEigengenes(., nPC=10, impute = FALSE, colors = rep(1, nrow(TAG_sc)),
+                   excludeGrey = FALSE, subHubs = FALSE, 
+                   scale = FALSE)
+
+TAG_sc_me_l$varExplained
+TAG_sc_me <- TAG_sc_me_l$eigengenes
+
+# LOO analysis
+TAG_loo <- LOO_analysis(sc_composition=TAG_sc, bruneck, me_merged, y)
+```
+
+```{r plot-VLDL-frac-sc-loo}
+TAG_loo$p_feature_loo
+TAG_loo$p_cluster_loo
+TAG_loo$p_feature_loo_per_cluster
+```
+
+## LDL supercluster
+
+```{r VLDL-frac-supercluster}
+# visual interpretation of merged_merged_pw_me.pdf
+LDL_sc_member_clusters <- c("LDL_C", "Total_cholesterol", "lnmr_AA4488")
+
+# individual feature members
+LDL_sc <- get_sc_composition(LDL_sc_member_clusters)
+
+# supercluster PC1
+LDL_sc_me_l <- bruneck %>%
+  dplyr::select(LDL_sc$feature) %>%
+  moduleEigengenes(., nPC=10, impute = FALSE, colors = rep(1, nrow(LDL_sc)),
+                   excludeGrey = FALSE, subHubs = FALSE, 
+                   scale = FALSE)
+
+LDL_sc_me_l$varExplained
+LDL_sc_me <- LDL_sc_me_l$eigengenes
+
+# LOO analysis
+LDL_loo <- LOO_analysis(sc_composition=LDL_sc, bruneck, me_merged, y)
+```
+
+```{r plot-VLDL-frac-sc-loo}
+LDL_loo$p_feature_loo
+LDL_loo$p_cluster_loo
+LDL_loo$p_feature_loo_per_cluster
+```
+
+## Logistic regression attempt
+
+```{r log-regr}
+
+# member clusters logistic regression
+clusters_fit <- me_merged %>%
+  dplyr::select(HDL_sc$me_name) %>%
+  bind_cols(y %>% dplyr::select(-one_of("Bruneckcode", "CVD0010W", "AGE"))) %>%
+  gather(outcome_var, outcome_value, -one_of(c(HDL_sc$me_name, "statin"))) %>%
+  group_by(outcome_var) %>%
+  do(tidy(glm(family = binomial(link='logit'),
+                            data = .,
+                            formula = as.formula(sprintf("outcome_value ~ %s + statin", 
+                                                         paste0(HDL_sc$me_name, collapse = "+")))
+              )))
+
+
+
+# member features logistic regression
+features_fit <- bruneck %>%
+  dplyr::select(HDL_sc$feature) %>%
+  bind_cols(y %>% dplyr::select(-one_of("Bruneckcode", "CVD0010W", "AGE"))) %>%
+  gather(outcome_var, outcome_value, -one_of(c(HDL_sc$feature, "statin"))) %>%
+  group_by(outcome_var) %>%
+  do(tidy(glm(family = binomial(link='logit'),
+                            data = .,
+                            formula = as.formula(sprintf("outcome_value ~ %s + statin", 
+                                                         paste0(HDL_sc$feature, collapse = "+")))
+              )))
+
+# member features log regr per cluster
+features_fit_per_cluster <- bruneck %>%
+  dplyr::select(HDL_sc$feature) %>%
+  bind_cols(y %>% dplyr::select(-one_of("Bruneckcode", "CVD0010W", "AGE"))) %>%
+  gather(outcome_var, outcome_value, -one_of(c(HDL_sc$feature, "statin"))) %>%
+  group_by(outcome_var ) %>%
+  do(tidy(glm(family = binomial(link='logit'),
+                            data = .,
+                            formula = as.formula(sprintf("outcome_value ~ %s + statin", 
+                                                         paste0(HDL_sc$feature, collapse = "+")))
+              )))
+```
+
+
+```{r}
+library(nlme)
+library(rms)
+lme
+
+summary(lm(formula=Sepal.Length~Sepal.Width, data=iris))
+summary(aov(formula=Sepal.Length~Sepal.Width, data=iris))
+
+testdf <- as_tibble(bind_cols(me_merged,y)) %>%
+  mutate_at(vars(CVD0010, SEX, statin, diabetes, HRCVD), as.factor)
+
+
+
+summary(lm(lms_ME2B5080~CVD0010, data=testdf))
+t.test(lms_ME2B5080~CVD0010, data=testdf)
+anova(lmer(lms_ME2B5080~CVD0010 + (1|SEX), data=testdf))
+
+coef(summary(lm(lms_ME2B5080~CVD0010+SEX, data=testdf)))
+
+lme_model <-lme(lms_ME2B5080~CVD0010, random=~1|SEX, data=testdf)
+plot(lme_model)
+qqnorm(residuals(lme_model))
+plot(residuals(lme_model))
+
+lm_model <- lm(lms_ME2B5080~CVD0010+SEX, data=testdf)
+plot(lm_model)
+qqnorm(residuals(lm_model))
+plot(residuals(lm_model))
+
+friedman.test(lms_ME2B5080~CVD0010|SEX, data = testdf)
+
+testdf$lms_ME2B5080_f <- factor(rank(testdf$lms_ME2B5080), ordered = TRUE)
+summary(polr(lms_ME2B5080_f~CVD0010+SEX, data = testdf))
+
+clm_model <- clm(lms_ME2B5080_f~CVD0010+SEX, data = testdf)
+summary(clm_model)
+
+lr_model <- glm(CVD0010~lms_ME2B5080+SEX+statin + lms_ME2B5080:SEX + lms_ME2B5080:statin, data = testdf, family = binomial(link="logit"))
+summary(lr_model)
+plot(lr_model)
+
+
+# don't use Hosmer-Lemeshow https://stats.stackexchange.com/questions/169438/evaluating-logistic-regression-and-interpretation-of-hosmer-lemeshow-goodness-of (F. Harrell)
+lr_model_reduced <- glm(CVD0010~lms_ME2B5080, data = testdf, family = binomial(link="logit"))
+lr_model_reduced_lrm <- lrm(CVD0010~lms_ME2B5080, data = testdf, x=TRUE, y=TRUE)
+summary(lr_model_reduced)
+
+resid(lr_model_reduced_lrm, "gof")['P']
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+

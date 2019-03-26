@@ -1,0 +1,13 @@
+softpower	corfnc	networktype	method	minModuleSize	deep
+4	cor	unsigned	average	20	1
+14	cor	signed	average	20	1
+6	bicor	signed hybrid	average	20	1
+4	cor	unsigned	average	10	1
+4	cor	unsigned	average	15	1
+4	cor	signed hybrid	average	20	1
+10	cor	signed	average	20	1
+10	bicor	signed	average	20	1
+4	cor	signed hybrid	average	3	4
+10	cor	signed	average	3	4
+4	cor	unsigned	average	3	4
+6	bicor	signed hybrid	average	3	4

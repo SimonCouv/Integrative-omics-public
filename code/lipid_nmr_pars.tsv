@@ -1,0 +1,24 @@
+softpower	corfnc	networktype	method	minModuleSize	deep	aim
+20	bicor	unsigned	average	20	1	optimal theory
+8	cor	unsigned	average	20	1	optimal theory
+8	cor	unsigned	average	20	2	optimal theory
+20	cor	signed	average	20	1	optimal theory
+8	bicor	unsigned	average	20	1	optimal theory
+8	bicor	unsigned	average	20	2	optimal theory
+8	bicor	unsigned	average	20	3	optimal theory
+20	bicor	signed	average	20	1	optimal theory
+14	bicor	unsigned	average	20	1	optimal theory
+8	cor	unsigned	average	3	4	Co-clustering
+20	cor	signed	average	3	4	Co-clustering
+8	bicor	unsigned	average	3	4	Co-clustering
+14	bicor	unsigned	average	3	4	Co-clustering
+20	bicor	unsigned	average	3	4	Co-clustering
+12	cor	signed	average	3	4	Co-clustering
+10	bicor	signed	average	3	4	Co-clustering
+14	bicor	signed	average	3	4	Co-clustering
+6	bicor	signed hybrid	average	3	4	Co-clustering
+9	bicor	signed hybrid	average	3	4	Co-clustering
+20	bicor	signed hybrid	average	3	4	Co-clustering
+9	cor	signed hybrid	average	3	4	Co-clustering
+7	cor	signed hybrid	average	3	4	Co-clustering
+14	cor	signed hybrid	average	3	4	Co-clustering
